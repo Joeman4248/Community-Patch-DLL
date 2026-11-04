@@ -270,7 +270,8 @@ bool CvConnectionService::Setup()
 	}
 
 	m_bInitialized = true;
-	SetVoxDeorumMode();  // Enable dialog suppression for crash auto-retry
+	// Port note: Vox Deorum calls SetVoxDeorumMode() here to hide error dialogs for its
+	// unattended crash auto-retry. Not ported: a human is playing, so keep VP's dialogs.
 	std::stringstream ss;
 	ss << "ConnectionService::Setup() - Successfully initialized with thread ID: " << m_dwThreadId;
 	Log(LOG_INFO, ss.str().c_str());
