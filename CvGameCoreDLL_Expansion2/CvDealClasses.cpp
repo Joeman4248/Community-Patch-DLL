@@ -15,6 +15,7 @@
 #include "CvMilitaryAI.h"
 #include "CvDiplomacyRequests.h"
 #include "CvCitySpecializationAI.h"
+#include "CvConnectionService.h"
 
 // must be included after all other headers
 #include "LintFree.h"
@@ -5256,6 +5257,30 @@ void CvGameDeals::ActivateDeal(PlayerTypes eFromPlayer, PlayerTypes eToPlayer, C
 	m_CurrentDeals.push_back(kDeal);
 
 	LogDealComplete(&kDeal);
+
+	// Vox Deorum: forward a DealMade event to the bridge (not a Lua hook)
+	if (MOD_IPC_CHANNEL) {
+		ICvEngineScriptSystem1* pkScriptSystem = gDLL->GetScriptSystem();
+		if (pkScriptSystem)
+		{
+			CvLuaArgsHandle args;
+			args->Push(eFromPlayer);
+			args->Push(eToPlayer);
+			args->Push(static_cast<int>(kDeal.GetStartTurn()));
+			args->Push(static_cast<int>(kDeal.GetPeaceTreatyType()));
+			args->Push(static_cast<int>(kDeal.m_TradedItems.size()));
+			for (TradedItemList::const_iterator it = kDeal.m_TradedItems.begin(); it != kDeal.m_TradedItems.end(); ++it)
+			{
+				args->Push(it->m_eFromPlayer);
+				args->Push(static_cast<int>(it->m_eItemType));
+				args->Push(it->m_iData1);
+				args->Push(it->m_iData2);
+				args->Push(it->m_iData3);
+				args->Push(it->m_iDuration);
+			}
+			CvConnectionService::GetInstance().ForwardGameEvent("DealMade", args.get());
+		}
+	}
 
 	if (pRenewDeal)
 	{

@@ -22,6 +22,7 @@
 #include "CvLuaPlot.h"
 #include "CvLuaUnit.h"
 #include "CvLuaLeague.h"
+#include "../CvConnectionService.h"
 
 #include "../CvGame.h"
 #include "../CvGameCoreUtils.h"
@@ -518,6 +519,15 @@ void CvLuaGame::RegisterMembers(lua_State* L)
 
 	Method(GetNumYieldTypes);
 	Method(GetBaseUnitUpgradeCost);
+
+	// Vox Deorum connection service
+	Method(RegisterFunction);
+	Method(UnregisterFunction);
+	Method(ProcessConnectionMessages);
+	Method(CallExternal);
+	Method(IsExternalRegistered);
+	Method(GetCurrentTimeEpochMs);
+	Method(BroadcastEvent);
 
 	Method(DeleteMPMP);
 	Method(CreateMPMP);
@@ -4255,6 +4265,62 @@ int CvLuaGame::lGetBaseUnitUpgradeCost(lua_State* L)
 	iCost *= iDivisor;
 
 	lua_pushinteger(L, max(iCost, iDivisor));
+	return 1;
+}
+
+//------------------------------------------------------------------------------
+// Vox Deorum connection service: Lua <=> external service communication.
+int CvLuaGame::lRegisterFunction(lua_State* L)
+{
+	const char* functionName = luaL_checkstring(L, 1);
+	luaL_checktype(L, 2, LUA_TFUNCTION);
+	CvConnectionService::GetInstance().RegisterLuaFunction(functionName, L, 2);
+	return 0;
+}
+
+// Lets a UI context drain the bridge's incoming queue while CvGame::update is not
+// ticking (leaderhead scene). No-op if another drain is running.
+int CvLuaGame::lProcessConnectionMessages(lua_State* L)
+{
+	CvConnectionService::GetInstance().ProcessMessagesFromUI();
+	return 0;
+}
+
+int CvLuaGame::lUnregisterFunction(lua_State* L)
+{
+	const char* functionName = luaL_checkstring(L, 1);
+	CvConnectionService::GetInstance().UnregisterLuaFunction(functionName);
+	return 0;
+}
+
+int CvLuaGame::lCallExternal(lua_State* L)
+{
+	return CvConnectionService::GetInstance().CallExternalFunction(L);
+}
+
+// Args: eventName (string), payload (table, optional), generateId (bool, optional)
+int CvLuaGame::lBroadcastEvent(lua_State* L)
+{
+	return CvConnectionService::GetInstance().BroadcastEventFromLua(L);
+}
+
+// Current wall-clock time as Unix epoch milliseconds.
+int CvLuaGame::lGetCurrentTimeEpochMs(lua_State* L)
+{
+	FILETIME ft;
+	GetSystemTimeAsFileTime(&ft);
+	ULARGE_INTEGER uli;
+	uli.LowPart  = ft.dwLowDateTime;
+	uli.HighPart = ft.dwHighDateTime;
+	const ULONGLONG EPOCH_OFFSET = 116444736000000000UI64; // 1601-01-01 to 1970-01-01 in 100ns
+	lua_pushnumber(L, (lua_Number)((uli.QuadPart - EPOCH_OFFSET) / 10000ULL));
+	return 1;
+}
+
+int CvLuaGame::lIsExternalRegistered(lua_State* L)
+{
+	const char* functionName = luaL_checkstring(L, 1);
+	lua_pushboolean(L, CvConnectionService::GetInstance().IsExternalFunctionRegistered(functionName));
 	return 1;
 }
 

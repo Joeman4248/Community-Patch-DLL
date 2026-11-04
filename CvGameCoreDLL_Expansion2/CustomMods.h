@@ -57,6 +57,9 @@
 // Enables Squads for VP support
 #define MOD_SQUADS													gCustomMods.isSQUADS()
 
+// Vox Deorum connection service (named pipe IPC channel), ported to 5.4.8
+#define MOD_IPC_CHANNEL												gCustomMods.isIPC_CHANNEL()
+
 // Enables writing gameplay statistics to a local SQLite database (stats.db) via SqliteLogger
 #define MOD_SQLITE_LOGGING											gCustomMods.isSQLITE_LOGGING()
 
@@ -1548,6 +1551,7 @@ public:
 	MOD_OPT_DECL(DIPLO_DEBUG_MODE);
 	MOD_OPT_DECL(CORE_DEBUGGING);
 	MOD_OPT_DECL(SQUADS);
+	MOD_OPT_DECL(IPC_CHANNEL);
 	MOD_OPT_DECL(SQLITE_LOGGING);
 
 	// Core Balance Changes

@@ -1,0 +1,3370 @@
+/*	-------------------------------------------------------------------------------------------------------
+Opens an IPC channel that exposes the game's internal state to external services.
+	------------------------------------------------------------------------------------------------------- */
+
+#include "CvGameCoreDLLPCH.h"
+#include "CvConnectionService.h"
+#include "CvConnectionSchema.h"
+#include "CvGlobals.h"
+#include "CvGameCoreUtils.h"
+#include "CvGame.h"
+#include "CvPlayer.h"
+#include "CustomMods.h"
+#include "FireWorks/FILogFile.h"
+#include "ICvDLLScriptSystem.h"
+#include "Lua/CvLuaSupport.h"
+#include <sstream>
+#include <iomanip>
+#include <cmath>
+#include <climits>
+#include <algorithm>
+#include <psapi.h>
+#pragma comment(lib, "psapi.lib")
+
+// Note: Buffer allocation moved to Setup() to avoid unnecessary memory usage when IPC is disabled
+
+// Vox Deorum: Registry keys for the tables that hold our registered functions (by name)
+// and pending async callbacks (by call ID). We used to keep both in numbered registry
+// slots from luaL_ref, but luaL_ref and luaL_unref share one unlocked free list (headed at
+// registry[0]) with the engine and every UI context, and we call them from the UI thread
+// as well as the game-core thread. A lost race on that list handed one slot to two owners:
+// after a crash-recovery reload, getVictoryProgress and getMilitaryReport ended up at the
+// same ref and every victory call ran the military script. String keys in our own tables
+// never touch the free list, and an entry can only be replaced by registering the same
+// name again.
+static const char* const s_szFunctionsKey = "VoxDeorum.Functions";
+static const char* const s_szCallbacksKey = "VoxDeorum.Callbacks";
+
+// Push one of our private registry tables onto L's stack, creating it if it is missing.
+// Setup creates both tables before any concurrent access. The create-if-missing check is
+// not thread safe, so it only serves registrations that run before Setup (on the
+// game-core thread) and a state whose registry Setup did not reach.
+static void PushPrivateTable(lua_State* L, const char* key)
+{
+	lua_pushstring(L, key);
+	lua_rawget(L, LUA_REGISTRYINDEX);
+	if (!lua_istable(L, -1))
+	{
+		lua_pop(L, 1);
+		lua_newtable(L);
+		lua_pushstring(L, key);
+		lua_pushvalue(L, -2);
+		lua_rawset(L, LUA_REGISTRYINDEX);
+	}
+}
+
+// Store the value on top of L's stack at table[field] in a private table, and pop it.
+static void SetPrivateEntry(lua_State* L, const char* tableKey, const char* field)
+{
+	PushPrivateTable(L, tableKey);   // value, table
+	lua_pushstring(L, field);        // value, table, field
+	lua_pushvalue(L, -3);            // value, table, field, value
+	lua_rawset(L, -3);               // value, table
+	lua_pop(L, 2);
+}
+
+// Remove table[field] from a private table.
+static void ClearPrivateEntry(lua_State* L, const char* tableKey, const char* field)
+{
+	PushPrivateTable(L, tableKey);
+	lua_pushstring(L, field);
+	lua_pushnil(L);
+	lua_rawset(L, -3);
+	lua_pop(L, 1);
+}
+
+// Push table[field] from a private table. Returns true and leaves the function on the
+// stack if the entry is a function; otherwise leaves the stack unchanged and returns false.
+static bool PushPrivateFunction(lua_State* L, const char* tableKey, const char* field)
+{
+	PushPrivateTable(L, tableKey);
+	lua_pushstring(L, field);
+	lua_rawget(L, -2);
+	lua_remove(L, -2);  // drop the table, keep the entry
+	if (!lua_isfunction(L, -1))
+	{
+		lua_pop(L, 1);
+		return false;
+	}
+	return true;
+}
+
+// Singleton instance getter
+CvConnectionService& CvConnectionService::GetInstance()
+{
+	static CvConnectionService instance;
+	return instance;
+}
+
+// Constructor
+CvConnectionService::CvConnectionService()
+	: m_bInitialized(false)
+	, m_pLuaState(NULL)
+	, m_pkScriptSystem(NULL)  // Initialize cached script system
+	, m_hPipe(INVALID_HANDLE_VALUE)
+	, m_hThread(NULL)
+	, m_dwThreadId(0)
+	, m_bClientConnected(false)
+	, m_bShutdownRequested(false)
+	, m_uiNextCallId(1)
+	, m_iProcessingDepth(0)  // Vox Deorum: reentrancy guard for ProcessMessages
+	, m_bUiDrainPolicy(false)  // Vox Deorum: set by whichever drain is outermost
+	, m_dwLastAITurnDeactivatedTime(0)
+	, m_bAICooldownActive(false)
+	, m_bProductionMode(false)
+	, m_uiCurrentTurn(0)
+	, m_uiEventSequence(1)
+	, m_dwLastGCTime(0)
+	, m_pMainThreadReadBuffer(NULL)
+	, m_pMainThreadWriteBuffer(NULL)
+{
+	// Vox Deorum: Outlives every Setup/Shutdown cycle. Shutdown takes this section to
+	// fence against an in-flight drain before freeing the buffers that drain is reading,
+	// which it could not do with a section of its own making.
+	InitializeCriticalSection(&m_csProcessing);
+}
+
+// Destructor
+CvConnectionService::~CvConnectionService()
+{
+	if (m_bInitialized)
+	{
+		Shutdown();
+	}
+
+	// Vox Deorum: Safe here and nowhere earlier — Shutdown above has already fenced out
+	// every drain, and the singleton is going away with the process.
+	DeleteCriticalSection(&m_csProcessing);
+}
+
+// Vox Deorum: Scope-bound drain section and depth counter.
+CvConnectionService::DrainScope::DrainScope(CRITICAL_SECTION& kSection, int& iDepth)
+	: m_kSection(kSection)
+	, m_iDepth(iDepth)
+	, m_bHeld(false)
+	, m_bCounted(false)
+{
+}
+
+CvConnectionService::DrainScope::~DrainScope()
+{
+	// Decrement rather than clear: a nested drain runs inside an outer one, and zeroing
+	// here would leave the rest of that outer drain unguarded against reentry.
+	if (m_bCounted)
+	{
+		m_iDepth--;
+	}
+	if (m_bHeld)
+	{
+		LeaveCriticalSection(&m_kSection);
+	}
+}
+
+bool CvConnectionService::DrainScope::TryAcquire()
+{
+	m_bHeld = (TryEnterCriticalSection(&m_kSection) != FALSE);
+	return m_bHeld;
+}
+
+void CvConnectionService::DrainScope::PushDepth()
+{
+	m_iDepth++;
+	m_bCounted = true;
+}
+
+// Initialize the connection service
+bool CvConnectionService::Setup()
+{
+	if (m_bInitialized)
+	{
+		Log(LOG_WARNING, "ConnectionService::Setup() called when already initialized");
+		return true;
+	}
+
+	Log(LOG_INFO, "ConnectionService::Setup() - Initializing connection service");
+
+	// Allocate the JSON buffers (512KB each)
+	m_pMainThreadReadBuffer = new DynamicJsonDocument(524288);
+	m_pMainThreadWriteBuffer = new DynamicJsonDocument(524288);
+
+	// Initialize critical sections for thread safety
+	InitializeCriticalSection(&m_csIncoming);
+	InitializeCriticalSection(&m_csOutgoing);
+	InitializeCriticalSection(&m_csFunctions);
+	InitializeCriticalSection(&m_csExternalFunctions);
+	InitializeCriticalSection(&m_csPendingCalls);
+	InitializeCriticalSection(&m_csPausedPlayers);  // Vox Deorum: For thread-safe access to paused players list
+	// Vox Deorum: m_csProcessing is deliberately absent — it is owned by the constructor
+	// so that Shutdown can fence drains out with it. See its declaration.
+
+	// Reset shutdown flag
+	m_bShutdownRequested = false;
+	m_bClientConnected = false;
+
+	// Cache the script system instance and create Lua thread
+	m_pkScriptSystem = gDLL->GetScriptSystem();
+	m_pLuaState = m_pkScriptSystem->CreateLuaThread("ConnectionService");
+
+	// Reading counters
+	m_uiCurrentTurn = GC.getGame().getGameTurn();
+	DeserializeEventSequence();
+
+	// Register game data with the Lua state
+	LuaSupport::RegisterScriptData(m_pLuaState);
+
+	// Vox Deorum: Clear leftover items from RegisterScriptData (e.g. PushTypeTable leaves
+	// type tables on the stack), so this state starts every script from an empty frame.
+	// ProcessLuaResult now measures results against a base recorded per call rather than
+	// against the whole frame, so leftovers are no longer mistaken for return values — but
+	// starting clean keeps the self-referential type tables (Type.__index = Type), which
+	// send ConvertLuaToJsonValue into infinite recursion, out of reach either way.
+	lua_settop(m_pLuaState, 0);
+
+	// Vox Deorum: Create our private registry tables now, on the game-core thread and before
+	// the pipe thread starts, so the UI and game-core threads never race to create them. A
+	// table that already exists (from an earlier load, or an early registration) is kept.
+	PushPrivateTable(m_pLuaState, s_szFunctionsKey);
+	PushPrivateTable(m_pLuaState, s_szCallbacksKey);
+	lua_settop(m_pLuaState, 0);
+
+	Log(LOG_INFO, "ConnectionService::Setup() - Lua state initialized, creating named pipe server");
+	
+	// Create the Named Pipe server thread
+	m_hThread = CreateThread(
+		NULL,                   // default security attributes
+		0,                      // default stack size
+		NamedPipeServerThread,  // thread function
+		this,                   // parameter to thread function
+		0,                      // default creation flags
+		&m_dwThreadId);         // thread identifier
+
+	if (m_hThread == NULL)
+	{
+		std::stringstream ss;
+		ss << "ConnectionService::Setup() - Failed to create thread, error: " << GetLastError();
+		Log(LOG_ERROR, ss.str().c_str());
+		return false;
+	}
+
+	if (!SetThreadPriority(m_hThread, THREAD_PRIORITY_HIGHEST))
+	{
+		std::stringstream ss;
+		ss << "ConnectionService::Setup() - Warning: Failed to set thread priority, error: " << GetLastError();
+		Log(LOG_WARNING, ss.str().c_str());
+	}
+	else
+	{
+		Log(LOG_INFO, "ConnectionService::Setup() - Thread priority set to THREAD_PRIORITY_HIGHEST");
+	}
+
+	// Vox Deorum: Also set current thread (main game thread) to high priority
+	if (!SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL))
+	{
+		std::stringstream ss;
+		ss << "ConnectionService::Setup() - Warning: Failed to set current thread priority, error: " << GetLastError();
+		Log(LOG_WARNING, ss.str().c_str());
+	}
+	else
+	{
+		Log(LOG_INFO, "ConnectionService::Setup() - Current thread priority set to THREAD_PRIORITY_ABOVE_NORMAL");
+	}
+
+	m_bInitialized = true;
+	SetVoxDeorumMode();  // Enable dialog suppression for crash auto-retry
+	std::stringstream ss;
+	ss << "ConnectionService::Setup() - Successfully initialized with thread ID: " << m_dwThreadId;
+	Log(LOG_INFO, ss.str().c_str());
+	
+	return true;
+}
+
+// Shutdown the connection service and cleanup resources
+void CvConnectionService::Shutdown()
+{
+	if (!m_bInitialized)
+	{
+		return;
+	}
+
+	Log(LOG_INFO, "ConnectionService::Shutdown() - Shutting down connection service");
+
+	// Vox Deorum: Close the drain before tearing anything down. Taking the section blocks
+	// until an in-flight drain finishes, and clearing m_bInitialized while holding it means
+	// the next drain — including one already on its way in from a UI update, which is not
+	// on this thread and does not stop when the game core does — halts at the initialized
+	// check rather than reaching the critical sections and JSON buffers freed below.
+	EnterCriticalSection(&m_csProcessing);
+	m_bInitialized = false;
+	LeaveCriticalSection(&m_csProcessing);
+
+	// Save event sequence before shutting down
+	SerializeEventSequence();
+
+	// Signal the thread to shutdown
+	m_bShutdownRequested = true;
+	
+	// Force disconnect any connected client first
+	m_bClientConnected = false;
+
+	// Close the pipe if it's open to wake up the thread
+	if (m_hPipe != INVALID_HANDLE_VALUE)
+	{
+		// Cancel any pending I/O operations
+		CancelIo(m_hPipe);
+		
+		// Disconnect and close the pipe
+		DisconnectNamedPipe(m_hPipe);
+		CloseHandle(m_hPipe);
+		m_hPipe = INVALID_HANDLE_VALUE;
+	}
+
+	// Wait for the thread to finish (max 5 seconds)
+	if (m_hThread != NULL)
+	{
+		Log(LOG_INFO, "ConnectionService::Shutdown() - Waiting for thread to terminate");
+		DWORD waitResult = WaitForSingleObject(m_hThread, 5000);
+		
+		if (waitResult == WAIT_TIMEOUT)
+		{
+			Log(LOG_WARNING, "ConnectionService::Shutdown() - Thread did not terminate gracefully, forcing termination");
+			TerminateThread(m_hThread, 1);
+		}
+		else if (waitResult == WAIT_OBJECT_0)
+		{
+			Log(LOG_INFO, "ConnectionService::Shutdown() - Thread terminated gracefully");
+		}
+		
+		CloseHandle(m_hThread);
+		m_hThread = NULL;
+	}
+
+	// Clean up Lua state
+	if (m_pkScriptSystem && m_pLuaState)
+	{
+		m_pkScriptSystem->FreeLuaThread(m_pLuaState);
+		m_pLuaState = NULL;
+		Log(LOG_INFO, "ConnectionService::Shutdown() - Lua state freed");
+	}
+
+	// Clear all registered Lua functions
+	EnterCriticalSection(&m_csFunctions);
+	m_registeredFunctions.clear();
+	LeaveCriticalSection(&m_csFunctions);
+	
+	// Clear any pending external calls
+	EnterCriticalSection(&m_csPendingCalls);
+	m_pendingExternalCalls.clear();
+	m_syncCallResults.clear();
+	LeaveCriticalSection(&m_csPendingCalls);
+
+	// Clean up critical sections
+	DeleteCriticalSection(&m_csIncoming);
+	DeleteCriticalSection(&m_csOutgoing);
+	DeleteCriticalSection(&m_csFunctions);
+	DeleteCriticalSection(&m_csExternalFunctions);
+	DeleteCriticalSection(&m_csPendingCalls);
+	DeleteCriticalSection(&m_csPausedPlayers);  // Vox Deorum: Clean up paused players critical section
+	// Vox Deorum: m_csProcessing survives — the destructor owns it. See its declaration.
+
+	// Free the JSON buffers
+	if (m_pMainThreadReadBuffer)
+	{
+		delete m_pMainThreadReadBuffer;
+		m_pMainThreadReadBuffer = NULL;
+	}
+	if (m_pMainThreadWriteBuffer)
+	{
+		delete m_pMainThreadWriteBuffer;
+		m_pMainThreadWriteBuffer = NULL;
+	}
+
+	// Clear any remaining messages in the queues
+	while (!m_incomingQueue.empty())
+	{
+		m_incomingQueue.pop();
+	}
+	while (!m_outgoingQueue.empty())
+	{
+		m_outgoingQueue.pop();
+	}
+
+	m_bInitialized = false;
+	m_bClientConnected = false;
+	Log(LOG_INFO, "ConnectionService::Shutdown() - Successfully shut down");
+}
+
+// Log a message to the connection log file
+void CvConnectionService::Log(LogLevel level, const char* message)
+{
+	// Vox Deorum: Guard against NULL messages to prevent downstream pLog->Msg(NULL)
+	// which scans memory for a terminator and can walk past the end of mapped pages.
+	if (message == NULL)
+	{
+		return;
+	}
+
+	// Only log if logging is enabled in the game
+	if (!GC.getLogging())
+	{
+		return;
+	}
+
+	// Vox Deorum: Use a separate FILogFile for the pipe thread to avoid lock contention.
+	// FILogFile::Msg holds an internal critical section during disk I/O; if both threads
+	// share one instance, the main thread can block waiting for the pipe thread's write.
+	bool bIsPipeThread = (GetCurrentThreadId() == m_dwThreadId);
+	FILogFile* pLog = bIsPipeThread ? GetPipeLogFile() : GetLogFile();
+	if (pLog)
+	{
+		std::stringstream ss;
+
+		// Add timestamp
+		SYSTEMTIME st;
+		GetLocalTime(&st);
+		ss << "[" << std::setfill('0') << std::setw(2) << st.wHour << ":"
+		   << std::setfill('0') << std::setw(2) << st.wMinute << ":"
+		   << std::setfill('0') << std::setw(2) << st.wSecond << "."
+		   << std::setfill('0') << std::setw(3) << st.wMilliseconds << "] ";
+
+		// Add turn number prefix. GC.getGame() is NOT thread-safe, so the pipe
+		// thread uses the cached m_uiCurrentTurn (updated once per turn on the main thread).
+		if (bIsPipeThread)
+		{
+			ss << "[Turn ~" << m_uiCurrentTurn << "] ";
+		}
+		else
+		{
+			ss << "[Turn " << GC.getGame().getElapsedGameTurns() << "] ";
+		}
+		
+		// Add log level prefix
+		switch (level)
+		{
+		case LOG_DEBUG:
+			ss << "[DEBUG] ";
+			break;
+		case LOG_INFO:
+			ss << "[INFO] ";
+			break;
+		case LOG_WARNING:
+			ss << "[WARNING] ";
+			break;
+		case LOG_ERROR:
+			ss << "[ERROR] ";
+			break;
+		default:
+			ss << "[UNKNOWN] ";
+			break;
+		}
+		
+		// Add the actual message with truncation. FILogFile::Msg is implemented in the
+		// engine and formats into an internal buffer of unknown size; keep the WHOLE
+		// formatted line (timestamp/turn/level prefix + message + truncation suffix,
+		// together up to ~128 bytes on top of the message) under 4096 to stay clear of it.
+		std::string msgStr(message);
+		const size_t maxBytes = 3968;
+		if (msgStr.length() > maxBytes) {
+			size_t truncatedLen = msgStr.length() - maxBytes;
+			msgStr = msgStr.substr(0, maxBytes);
+			ss << msgStr << "[..." << truncatedLen << " characters truncated]";
+		} else {
+			ss << msgStr;
+		}
+
+		// Write to log file
+		// Vox Deorum: Call separate function to handle SEH without object unwinding issues
+		SafeLogMessage(pLog, ss.str().c_str());
+	}
+}
+
+// Vox Deorum: Separate function to handle SEH without C2712 error
+void CvConnectionService::SafeLogMessage(FILogFile* pLog, const char* message)
+{
+	// Vox Deorum: Guard before entering the __try. pLog->Msg(NULL) will scan past the
+	// end of memory for a null terminator; SEH only catches the eventual AV, which
+	// can manifest as a "forever hang" from the caller's perspective.
+	if (pLog == NULL || message == NULL)
+	{
+		return;
+	}
+
+	__try
+	{
+		// Vox Deorum: Msg is printf-style and previously received the message AS the
+		// format string — proven by the pipe log, where the "!@#$%^!" delimiter came
+		// out as "!@#$^!" (the '%' consumed as a conversion intro). Any "%s" appearing
+		// in forwarded JSON or LLM-generated text would make the engine read a garbage
+		// varargs pointer. Pass a fixed format so content is never interpreted.
+		pLog->Msg("%s", message);
+	}
+	__except(EXCEPTION_EXECUTE_HANDLER)
+	{
+		// Vox Deorum: If logging fails, try to log a simple failure message
+		pLog->Msg("[ERROR] Previous log message failed to write");
+	}
+}
+
+// Get the log file for writing (main thread)
+FILogFile* CvConnectionService::GetLogFile()
+{
+	return LOGFILEMGR.GetLog("connection.log", FILogFile::kDontTimeStamp);
+}
+
+// Vox Deorum: Separate log file for the pipe thread. FILogFile::Msg holds an internal
+// critical section for the duration of its disk write. If both threads share one FILogFile,
+// the main thread can block on the lock while the pipe thread is mid-write, causing hangs.
+FILogFile* CvConnectionService::GetPipeLogFile()
+{
+	return LOGFILEMGR.GetLog("connection-pipe.log", FILogFile::kDontTimeStamp);
+}
+
+// Named Pipe server thread function
+DWORD WINAPI CvConnectionService::NamedPipeServerThread(LPVOID lpParam)
+{
+	CvConnectionService* pService = static_cast<CvConnectionService*>(lpParam);
+
+	// Get pipe name from environment variable, default to "vox-deorum-bridge"
+	char pipeNameBuffer[256];
+	const char* envPipeName = getenv("VOX_DEORUM_PIPE_NAME");
+	const char* basePipeName = envPipeName ? envPipeName : "vox-deorum-bridge";
+	sprintf_s(pipeNameBuffer, sizeof(pipeNameBuffer), "\\\\.\\pipe\\tmp-app.%s", basePipeName);
+	const char* pipeName = pipeNameBuffer;
+	
+	while (!pService->m_bShutdownRequested)
+	{
+		// Create the Named Pipe
+		HANDLE hPipe = CreateNamedPipeA(
+			pipeName,                  // pipe name
+			PIPE_ACCESS_DUPLEX,        // read/write access
+			PIPE_TYPE_MESSAGE |        // message type pipe
+			PIPE_READMODE_MESSAGE |    // message-read mode
+			PIPE_NOWAIT,               // non-blocking mode
+			1,                         // max instances (only one client - Bridge Service)
+			262144,                      // output buffer size
+			262144,                      // input buffer size
+			0,                         // client time-out
+			NULL);                     // default security attributes
+		
+		if (hPipe == INVALID_HANDLE_VALUE)
+		{
+			std::stringstream ss;
+			ss << "NamedPipeServerThread - Failed to create Named Pipe, error: " << GetLastError();
+			pService->Log(LOG_ERROR, ss.str().c_str());
+			Sleep(50); // Wait before retrying
+			continue;
+		}
+		
+		pService->m_hPipe = hPipe;
+		pService->Log(LOG_INFO, "NamedPipeServerThread - Named Pipe created, waiting for client connection");
+		
+		// Wait for client to connect (non-blocking mode)
+		BOOL waitingForClient = true;
+		while (waitingForClient && !pService->m_bShutdownRequested)
+		{
+			BOOL connected = ConnectNamedPipe(hPipe, NULL);
+			DWORD error = GetLastError();
+			
+			if (connected || error == ERROR_PIPE_CONNECTED)
+			{
+				// Client successfully connected
+				waitingForClient = false;
+			}
+			else if (error == ERROR_PIPE_LISTENING)
+			{
+				// Still waiting for client connection in non-blocking mode
+				Sleep(50); // Wait 50ms before checking again
+			}
+			else if (error == ERROR_NO_DATA)
+			{
+				// Pipe is in non-blocking mode and no client is ready
+				Sleep(50); // Wait 50ms before checking again
+			}
+			else
+			{
+				// Actual error occurred
+				std::stringstream ss;
+				ss << "NamedPipeServerThread - Failed to connect to client, error: " << error;
+				pService->Log(LOG_ERROR, ss.str().c_str());
+				CloseHandle(hPipe);
+				pService->m_hPipe = INVALID_HANDLE_VALUE;
+				waitingForClient = false;
+				
+				break; // Exit the inner loop to create a new pipe
+			}
+		}
+		
+		// Check if we should continue (client connected) or retry (error or shutdown)
+		if (pService->m_bShutdownRequested || pService->m_hPipe == INVALID_HANDLE_VALUE)
+		{
+			if (pService->m_hPipe != INVALID_HANDLE_VALUE)
+			{
+				CloseHandle(hPipe);
+				pService->m_hPipe = INVALID_HANDLE_VALUE;
+			}
+			continue;
+		}
+		
+		// Client connected
+		pService->m_bClientConnected = true;
+		pService->Log(LOG_INFO, "NamedPipeServerThread - Bridge Service connected");
+		
+		// Handle the client connection
+		pService->HandleClientConnection(hPipe);
+		
+		// Client disconnected
+		pService->m_bClientConnected = false;
+		pService->Log(LOG_INFO, "NamedPipeServerThread - Bridge Service disconnected");
+
+		// Vox Deorum: Clear paused players list and reset production mode when pipe disconnects
+		EnterCriticalSection(&pService->m_csPausedPlayers);
+		pService->m_pausedPlayers.clear();
+		LeaveCriticalSection(&pService->m_csPausedPlayers);
+		pService->m_bAICooldownActive = false;
+		pService->m_bProductionMode = false;
+		
+		// Cleanup
+		if (pService->m_hPipe != INVALID_HANDLE_VALUE) {
+			DisconnectNamedPipe(hPipe);
+			CloseHandle(hPipe);
+			pService->m_hPipe = INVALID_HANDLE_VALUE;
+		}
+		
+		// Small delay before accepting new connection
+		if (!pService->m_bShutdownRequested)
+		{
+			Sleep(50);
+		}
+	}
+	
+	pService->Log(LOG_INFO, "NamedPipeServerThread - Thread exiting");
+	return 0;
+}
+
+// Handle a single client connection
+void CvConnectionService::HandleClientConnection(HANDLE hPipe)
+{
+	// Define chunk size for message splitting (32KB chunks)
+	const size_t OUTGOING_CHUNK_SIZE = 32768;
+
+	// Dynamic message buffer to avoid repeated allocations
+	std::string messageBuffer;
+	messageBuffer.reserve(262144); // Reserve initial capacity
+
+	// Temporary read buffer for pipe operations
+	char readBuffer[262144];
+	DWORD bytesRead, bytesWritten;
+	
+	while (m_bClientConnected && !m_bShutdownRequested)
+	{
+		// Send ALL queued outgoing messages
+		bool hasOutgoingMessages = true;
+		while (hasOutgoingMessages && m_bClientConnected && !m_bShutdownRequested)
+		{
+			std::string outgoingMessage;
+			if (DequeueOutgoingMessage(outgoingMessage))
+			{
+				// Add delimiter to the message
+				outgoingMessage += "!@#$%^!";
+
+				// Send the message in chunks if it's too large
+				size_t messageLength = outgoingMessage.length();
+				size_t bytesSent = 0;
+				BOOL success = TRUE;
+
+				while (bytesSent < messageLength && success)
+				{
+					// Calculate chunk size (don't exceed CHUNK_SIZE)
+					size_t chunkSize = std::min(OUTGOING_CHUNK_SIZE, messageLength - bytesSent);
+
+					// Send the chunk
+					success = WriteFile(
+						hPipe,
+						outgoingMessage.c_str() + bytesSent,
+						(DWORD)chunkSize,
+						&bytesWritten,
+						NULL);
+
+					if (success)
+					{
+						bytesSent += bytesWritten;
+					}
+				}
+
+				if (!success)
+				{
+					DWORD error = GetLastError();
+
+					// If pipe is busy, put the message back and break inner loop
+					if (error == ERROR_PIPE_BUSY || error == ERROR_NO_DATA)
+					{
+						// Re-queue the message at the front (this is a limitation of std::queue)
+						// For now, we'll just log and skip
+						std::stringstream ss;
+						ss << "HandleClientConnection - Pipe busy, will retry later. Error: " << error;
+						Log(LOG_WARNING, ss.str().c_str());
+						hasOutgoingMessages = false;
+					}
+					else
+					{
+						std::stringstream ss;
+						ss << "HandleClientConnection - Failed to send outgoing message, error: " << error;
+						Log(LOG_ERROR, ss.str().c_str());
+						break; // Break from inner loop on serious error
+					}
+				}
+				else
+				{
+					std::stringstream ss;
+					ss << "HandleClientConnection - Sent outgoing message: " << outgoingMessage;
+					Log(LOG_DEBUG, ss.str().c_str());
+				}
+			}
+			else
+			{
+				// No more messages to send
+				hasOutgoingMessages = false;
+			}
+		}
+		
+		// Flush the pipe after sending all messages to ensure the client receives the data
+		if (m_bClientConnected && !m_bShutdownRequested)
+		{
+			FlushFileBuffers(hPipe);
+		}
+		
+		// Read and process messages from client (non-blocking)
+		bool hasIncomingData = true;
+		int messagesProcessed = 0;
+		const int maxMessagesPerIteration = 100; // Prevent processing too many messages at once
+		const std::string delimiter = "!@#$%^!";
+		
+		while (hasIncomingData && messagesProcessed < maxMessagesPerIteration && m_bClientConnected && !m_bShutdownRequested)
+		{
+			// Try to read data from pipe
+			BOOL success = ReadFile(
+				hPipe,
+				readBuffer,
+				sizeof(readBuffer) - 1,
+				&bytesRead,
+				NULL);
+			
+			if (!success)
+			{
+				DWORD error = GetLastError();
+				
+				// If no data available, we've read everything
+				if (error == ERROR_NO_DATA)
+				{
+					hasIncomingData = false;
+				}
+				// Handle actual errors
+				else if (error == ERROR_BROKEN_PIPE || error == ERROR_PIPE_NOT_CONNECTED)
+				{
+					Log(LOG_INFO, "HandleClientConnection - Client disconnected");
+					return; // Break from main loop
+				}
+				else
+				{
+					std::stringstream ss;
+					ss << "HandleClientConnection - ReadFile failed, error: " << error;
+					Log(LOG_ERROR, ss.str().c_str());
+					return; // Break from main loop
+				}
+			}
+			else if (bytesRead == 0)
+			{
+				// No data read, we've read everything
+				hasIncomingData = false;
+			}
+			else
+			{
+				// Successfully read data
+				// Null-terminate the received data
+				readBuffer[bytesRead] = '\0';
+				
+				// Append to message buffer
+				messageBuffer.append(readBuffer, bytesRead);
+				
+				// Process complete messages from the buffer immediately
+				size_t pos = 0;
+				while ((pos = messageBuffer.find(delimiter)) != std::string::npos)
+				{
+					// Extract the message
+					std::string singleMessage = messageBuffer.substr(0, pos);
+					
+					// Only queue non-empty messages
+					if (!singleMessage.empty())
+					{
+						// Lock the incoming queue critical section
+						EnterCriticalSection(&m_csIncoming);
+						m_incomingQueue.push(singleMessage);
+						LeaveCriticalSection(&m_csIncoming);
+						
+						// Log the queuing action
+						std::stringstream ss;
+						ss << "HandleClientConnection - Queued message: " << singleMessage;
+						Log(LOG_DEBUG, ss.str().c_str());
+						
+						messagesProcessed++;
+					}
+					
+					// Remove the processed message and delimiter from buffer
+					messageBuffer.erase(0, pos + delimiter.length());
+					
+					// Break if we've processed enough messages
+					if (messagesProcessed >= maxMessagesPerIteration)
+					{
+						hasIncomingData = false; // Stop reading for this iteration
+						Log(LOG_WARNING, "HandleClientConnection - Reached max messages per iteration limit");
+						break;
+					}
+				}
+				
+				// Continue reading more data if we haven't hit the limit
+			}
+		}
+		
+		// Check if buffer is getting too large (prevent memory issues)
+		if (messageBuffer.size() > 10485760) // 10MB limit for incomplete messages
+		{
+			std::stringstream ss;
+			ss << "HandleClientConnection - Message buffer too large (" << messageBuffer.size() 
+			   << " bytes), clearing to prevent memory issues";
+			Log(LOG_WARNING, ss.str().c_str());
+			messageBuffer.clear();
+			messageBuffer.reserve(262144); // Re-reserve standard capacity
+		}
+		
+		// Small delay only if we didn't process many messages / we need to handle incoming messages.
+		if (messagesProcessed < 3 && !hasIncomingData)
+		{
+			Sleep(20); // Small delay to avoid busy waiting when idle
+		}
+	}
+	
+	// Log any remaining data in buffer when disconnecting
+	if (!messageBuffer.empty())
+	{
+		std::stringstream ss;
+		ss << "HandleClientConnection - Connection closed with " << messageBuffer.size() 
+		   << " bytes of incomplete data in buffer";
+		Log(LOG_WARNING, ss.str().c_str());
+	}
+}
+
+
+// Queue an outgoing message to send to the Bridge Service (called from game thread)
+// Returns the length of the outgoing queue after adding the message
+int CvConnectionService::QueueOutgoingMessage(const std::string& messageJson)
+{
+	// Lock the outgoing queue critical section
+	EnterCriticalSection(&m_csOutgoing);
+	
+	// Add the message to the queue
+	m_outgoingQueue.push(messageJson);
+	
+	// Get the queue size
+	int queueSize = static_cast<int>(m_outgoingQueue.size());
+	
+	// Release the critical section
+	LeaveCriticalSection(&m_csOutgoing);
+	
+	return queueSize;
+}
+
+// Dequeue an outgoing message to send to the Bridge Service (called from SSE thread)
+bool CvConnectionService::DequeueOutgoingMessage(std::string& messageJson)
+{
+	bool hasMessage = false;
+	
+	// Lock the outgoing queue critical section
+	EnterCriticalSection(&m_csOutgoing);
+	
+	// Check if there are messages to send
+	if (!m_outgoingQueue.empty())
+	{
+		// Get the message from the front of the queue
+		messageJson = m_outgoingQueue.front();
+		m_outgoingQueue.pop();
+		hasMessage = true;
+	}
+	
+	// Release the critical section
+	LeaveCriticalSection(&m_csOutgoing);
+	
+	return hasMessage;
+}
+
+// Process queued messages from the main game thread
+void CvConnectionService::ProcessMessages()
+{
+	DrainIncomingMessages(DRAIN_GAME_CORE);
+}
+
+// Vox Deorum: Drain on behalf of a UI Lua context while the game core is not ticking.
+// Deliberately not the same drain as ProcessMessages: see the header for what a UI-thread
+// caller is and is not allowed to route.
+void CvConnectionService::ProcessMessagesFromUI()
+{
+	DrainIncomingMessages(DRAIN_UI);
+}
+
+// Vox Deorum: Whether this message type has to wait for a game-core pump point.
+bool CvConnectionService::IsGameCoreOnlyMessageType(const std::string& messageType)
+{
+	// stub for now until we find something really bad
+	return false;
+}
+
+// Vox Deorum: Shared drain body. See m_csProcessing and m_iProcessingDepth in the header
+// for why only one thread drains at a time, why an ordinary pump refuses to nest, and why
+// the synchronous external-call wait loop is the one caller allowed through.
+void CvConnectionService::DrainIncomingMessages(DrainCaller eCaller)
+{
+	// Scope-bound so every path out of here — the early returns below, or a throw escaping
+	// the routing loop — pops the depth and releases the section.
+	DrainScope kScope(m_csProcessing, m_iProcessingDepth);
+
+	// Another thread is already draining. Skip this pump rather than waiting: every caller
+	// is latency-sensitive (a render frame, a turn, a blocked Lua call) and the queue is
+	// not going anywhere — whoever holds the section is emptying it right now.
+	if (!kScope.TryAcquire())
+	{
+		return;
+	}
+
+	// Checked under the section, not before it: Shutdown clears this while holding the
+	// section, so reaching this point means the queues and buffers below stay alive for
+	// the rest of this drain.
+	if (!m_bInitialized)
+	{
+		return;
+	}
+
+	if (m_iProcessingDepth > 0)
+	{
+		// Only the external-call wait loop may nest. ForwardGameEvent reaches us from Lua
+		// event hooks that fire during game-core mutations (e.g. CvUnit::build), and
+		// nesting there defers nothing: the outer drain picks the same queue up as soon
+		// as the hook returns.
+		if (eCaller != DRAIN_AWAIT)
+		{
+			return;
+		}
+
+		// The wait loop is different — it cannot make progress until its own response
+		// is routed — but bound how deep that may go.
+		if (m_iProcessingDepth >= MAX_DRAIN_DEPTH)
+		{
+			Log(LOG_WARNING, "DrainIncomingMessages - Reentrant drain depth reached; letting the waiting call time out");
+			return;
+		}
+	}
+	else
+	{
+		// The outermost drain fixes the routing policy every nested drain then inherits.
+		// A DRAIN_AWAIT that lands here came from Lua on a thread we cannot identify from
+		// here, so it takes the restrictive policy: declining a message costs it a wait,
+		// while routing one wrongly costs game-core work on the wrong thread.
+		m_bUiDrainPolicy = (eCaller != DRAIN_GAME_CORE);
+	}
+	kScope.PushDepth();
+	const bool bUiPolicy = m_bUiDrainPolicy;
+
+	int processedCount = 0;
+
+	// Messages this drain was not allowed to route, handed back below in arrival order.
+	std::vector<std::string> deferredMessages;
+
+	// Vox Deorum: Drain all queued messages in a single pass. Pause logic
+	// is now handled by the caller (CvGame::update) so the engine's UI/render
+	// loop keeps running during pauses, allowing camera ops like UI.LookAt.
+	{
+		// Track whether m_csIncoming is held so the exception handler
+		// can release it if needed, preventing permanent deadlock of the pipe thread
+		bool bCsHeld = false;
+		try {
+			// Lock the incoming queue critical section
+			EnterCriticalSection(&m_csIncoming);
+			bCsHeld = true;
+
+			// Process all queued messages
+			while (!m_incomingQueue.empty())
+			{
+				// Get the message from the front of the queue
+				std::string msgJson = m_incomingQueue.front();
+				m_incomingQueue.pop();
+
+				// Temporarily release the lock to process the message
+				LeaveCriticalSection(&m_csIncoming);
+				bCsHeld = false;
+
+				// Route the message to the appropriate handler
+				if (RouteMessage(msgJson, bUiPolicy))
+				{
+					processedCount++;
+				}
+				else
+				{
+					// Not this drain's to run. Hold it aside rather than pushing it back
+					// now, which would hand it straight back to this same loop.
+					deferredMessages.push_back(msgJson);
+				}
+
+				// Re-acquire the lock for the next iteration
+				EnterCriticalSection(&m_csIncoming);
+				bCsHeld = true;
+			}
+
+			// Hand back everything this drain declined, in arrival order, for the next
+			// game-core pump. The queue is empty at this point, so they return to the
+			// front unless the pipe thread has since added more.
+			for (size_t i = 0; i < deferredMessages.size(); i++)
+			{
+				m_incomingQueue.push(deferredMessages[i]);
+			}
+			if (!deferredMessages.empty())
+			{
+				std::stringstream ss;
+				ss << "DrainIncomingMessages - Deferred " << deferredMessages.size()
+					<< " game-core-only message(s) to the next game-core pump";
+				Log(LOG_DEBUG, ss.str().c_str());
+			}
+
+			// Release the critical section
+			LeaveCriticalSection(&m_csIncoming);
+			bCsHeld = false;
+		}
+		catch (...)
+		{
+			// Give back anything set aside before the throw. A message this drain was not
+			// allowed to route is not a message it is allowed to lose, and the queue is
+			// the only copy — the pipe thread has long since moved on.
+			if (!deferredMessages.empty())
+			{
+				if (!bCsHeld)
+				{
+					EnterCriticalSection(&m_csIncoming);
+					bCsHeld = true;
+				}
+				for (size_t i = 0; i < deferredMessages.size(); i++)
+				{
+					m_incomingQueue.push(deferredMessages[i]);
+				}
+			}
+
+			if (bCsHeld)
+			{
+				LeaveCriticalSection(&m_csIncoming);
+			}
+			std::stringstream ss;
+			ss << "DrainIncomingMessages - Unknown exception processing messages";
+			Log(LOG_ERROR, ss.str().c_str());
+		}
+	}
+
+	// Check memory usage every 60 seconds (debug)
+	if (processedCount > 0 && m_pLuaState)
+	{
+		DWORD currentTime = GetTickCount();
+		DWORD timeSinceLastGC = (currentTime >= m_dwLastGCTime) ?
+			(currentTime - m_dwLastGCTime) :
+			(UINT_MAX - m_dwLastGCTime + currentTime + 1); // Handle tick count wrap-around
+
+		if (timeSinceLastGC >= 60000) // 60 seconds
+		{
+			// Handle thread locks for safe Lua GC
+			bool bHadLock = gDLL->HasGameCoreLock();
+			if (bHadLock)
+			{
+				gDLL->ReleaseGameCoreLock();
+			}
+
+			int result = lua_gc(m_pLuaState, LUA_GCCOUNT, 0);
+
+			// Restore game core lock if we had it
+			if (bHadLock)
+			{
+				gDLL->GetGameCoreLock();
+			}
+
+			// Get process memory statistics after GC
+			PROCESS_MEMORY_COUNTERS_EX pmc;
+			pmc.cb = sizeof(pmc);
+			GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc));
+
+			std::stringstream ss;
+			ss << "GarbageCollection - Lua Memory: " << result << "KB"
+				<< " | Process Memory: "
+				<< "Private Bytes: " << (pmc.PrivateUsage / (1024 * 1024)) << "MB, "
+				<< "Virtual Bytes: " << (pmc.PagefileUsage / (1024 * 1024)) << "MB, "
+				<< "Working Set: " << (pmc.WorkingSetSize / (1024 * 1024)) << "MB, "
+				<< "Peak Working Set: " << (pmc.PeakWorkingSetSize / (1024 * 1024)) << "MB";
+			Log(LOG_DEBUG, ss.str().c_str());
+
+			m_dwLastGCTime = currentTime;
+		}
+	}
+
+	// Vox Deorum: kScope pops the depth and releases the section as it goes out of scope.
+}
+
+// Send a message to the Bridge Service (called from game code)
+// Returns the length of the outgoing queue after adding the message
+int CvConnectionService::SendMessage(const DynamicJsonDocument& message)
+{
+	if (!m_bInitialized)
+	{
+		Log(LOG_WARNING, "SendMessage - Cannot send message, service not initialized");
+		return 0;
+	}
+	
+	// Serialize the message
+	std::string messageStr;
+	serializeJson(message, messageStr);
+	
+	// Queue the wrapped message and return the queue size
+	return QueueOutgoingMessage(messageStr);
+}
+
+// Route incoming message to appropriate handler based on type
+bool CvConnectionService::RouteMessage(const std::string& messageJson, bool bUiPolicy)
+{
+	// Clear and reuse the read buffer for main thread message processing
+	m_pMainThreadReadBuffer->clear();
+	DeserializationError error = deserializeJson(*m_pMainThreadReadBuffer, messageJson);
+
+	if (error)
+	{
+		std::stringstream ss;
+		ss << "RouteMessage - Failed to parse JSON: " << error.c_str();
+		Log(LOG_ERROR, ss.str().c_str());
+		return true;  // Unparseable: dropping it is the handling, not a deferral
+	}
+
+	// Vox Deorum: Every const char* returned by ArduinoJson aliases m_pMainThreadReadBuffer.
+	// If any downstream handler (HandleLuaCall -> lua_pcall, etc.) transitively re-enters
+	// RouteMessage, that buffer will be cleared and our pointers will dangle. Copy every
+	// string we need into std::string locals up front so their lifetime is tied to this
+	// stack frame, not the shared document.
+	const char* rawMessageType = (*m_pMainThreadReadBuffer)["type"];
+	if (rawMessageType == NULL)
+	{
+		Log(LOG_WARNING, "RouteMessage - Message missing 'type' field");
+		return true;  // Malformed: dropping it is the handling, not a deferral
+	}
+	std::string messageType(rawMessageType);
+
+	// Vox Deorum: A UI-thread drain hands this type back untouched, still queued, for the
+	// next game-core pump. Checked before any handler runs so the decision cannot depend
+	// on work already half-applied.
+	if (bUiPolicy && IsGameCoreOnlyMessageType(messageType))
+	{
+		return false;
+	}
+
+	// Route to appropriate handler based on message type
+	if (messageType == "lua_execute")
+	{
+		// Extract parameters from JSON message and copy into stable locals
+		const char* rawScript = (*m_pMainThreadReadBuffer)["script"];
+		const char* rawId = (*m_pMainThreadReadBuffer)["id"];
+
+		if (rawScript && rawId)
+		{
+			std::string script(rawScript);
+			std::string id(rawId);
+			HandleLuaExecute(script.c_str(), id.c_str());
+		}
+	}
+	else if (messageType == "lua_call")
+	{
+		// Extract parameters from JSON message and copy into stable locals
+		const char* rawFunctionName = (*m_pMainThreadReadBuffer)["function"];
+		const char* rawId = (*m_pMainThreadReadBuffer)["id"];
+
+		if (rawFunctionName && rawId)
+		{
+			std::string functionName(rawFunctionName);
+			std::string id(rawId);
+
+			// Vox Deorum: Re-parse args into a function-scoped document so the
+			// JsonArray passed to HandleLuaCall does not alias m_pMainThreadReadBuffer.
+			// 256KB: structured Lua arguments use an ArduinoJson node pool rather
+			// than a wire-byte buffer. The human-control OptionsReport and nested
+			// diplomacy transcript batches need ample node overhead.
+			std::string argsStr;
+			if (serializeJson((*m_pMainThreadReadBuffer)["args"], argsStr) == 0)
+			{
+				m_pMainThreadWriteBuffer->clear();
+				(*m_pMainThreadWriteBuffer)["type"] = "lua_response";
+				(*m_pMainThreadWriteBuffer)["id"] = id;
+				(*m_pMainThreadWriteBuffer)["success"] = false;
+				(*m_pMainThreadWriteBuffer)["error"]["code"] = "ARGS_SERIALIZATION_FAILED";
+				(*m_pMainThreadWriteBuffer)["error"]["message"] = "Could not serialize lua_call arguments";
+				SendMessage(*m_pMainThreadWriteBuffer);
+				Log(LOG_ERROR, "RouteMessage - Could not serialize lua_call arguments");
+				return true;  // Answered with an error response, so it is handled
+			}
+
+			DynamicJsonDocument argsDoc(262144);
+			DeserializationError argsError = deserializeJson(argsDoc, argsStr);
+			if (argsError)
+			{
+				std::stringstream ss;
+				ss << "RouteMessage - Failed to isolate lua_call args: " << argsError.c_str();
+				Log(LOG_ERROR, ss.str().c_str());
+				m_pMainThreadWriteBuffer->clear();
+				(*m_pMainThreadWriteBuffer)["type"] = "lua_response";
+				(*m_pMainThreadWriteBuffer)["id"] = id;
+				(*m_pMainThreadWriteBuffer)["success"] = false;
+				(*m_pMainThreadWriteBuffer)["error"]["code"] = "ARGS_ISOLATION_FAILED";
+				(*m_pMainThreadWriteBuffer)["error"]["message"] = "Could not isolate lua_call arguments";
+				SendMessage(*m_pMainThreadWriteBuffer);
+				return true;  // Answered with an error response, so it is handled
+			}
+
+			JsonArray stableArgs = argsDoc.as<JsonArray>();
+			HandleLuaCall(functionName.c_str(), stableArgs, id.c_str());
+		}
+	}
+	else if (messageType == "external_register")
+	{
+		// Extract parameters for external function registration
+		const char* rawFunctionName = (*m_pMainThreadReadBuffer)["name"];
+		bool bAsync = (*m_pMainThreadReadBuffer)["async"];
+
+		if (rawFunctionName)
+		{
+			std::string functionName(rawFunctionName);
+			RegisterExternalFunction(functionName.c_str(), bAsync);
+		}
+	}
+	else if (messageType == "external_unregister")
+	{
+		// Extract function name for unregistration
+		const char* rawFunctionName = (*m_pMainThreadReadBuffer)["name"];
+
+		if (rawFunctionName)
+		{
+			std::string functionName(rawFunctionName);
+			UnregisterExternalFunction(functionName.c_str());
+		}
+	}
+	else if (messageType == "external_response")
+	{
+		// Extract parameters for external call response
+		const char* rawCallId = (*m_pMainThreadReadBuffer)["id"];
+		bool bSuccess = (*m_pMainThreadReadBuffer)["success"];
+
+		if (rawCallId == NULL)
+		{
+			return true;  // Unroutable without an id: dropping it is the handling
+		}
+
+		std::string callId(rawCallId);
+
+		// Parse error code from error object if present
+		std::string errorStr;
+		bool bHasError = false;
+		if (m_pMainThreadReadBuffer->containsKey("error") && (*m_pMainThreadReadBuffer)["error"].containsKey("code"))
+		{
+			const char* rawErr = (*m_pMainThreadReadBuffer)["error"]["code"];
+			if (rawErr)
+			{
+				errorStr = rawErr;
+				bHasError = true;
+			}
+		}
+
+		// Convert result to string if present (protocol uses "result" field)
+		std::string dataStr;
+		bool bHasData = false;
+		if (m_pMainThreadReadBuffer->containsKey("result"))
+		{
+			serializeJson((*m_pMainThreadReadBuffer)["result"], dataStr);
+			bHasData = true;
+		}
+
+		// Handle the response
+		HandleExternalCallResponse(callId.c_str(),
+			bSuccess,
+			bHasError ? errorStr.c_str() : (const char*)0,
+			bHasData ? dataStr.c_str() : (const char*)0);
+	}
+	else if (messageType == "pause_player")
+	{
+		// Vox Deorum: Handle player pause request
+		int iPlayerID = (*m_pMainThreadReadBuffer)["playerID"];
+		AddPausedPlayer(iPlayerID);
+	}
+	else if (messageType == "unpause_player")
+	{
+		// Vox Deorum: Handle player unpause request
+		int iPlayerID = (*m_pMainThreadReadBuffer)["playerID"];
+		RemovePausedPlayer(iPlayerID);
+	}
+	else if (messageType == "clear_paused_players")
+	{
+		// Vox Deorum: Handle clear all paused players request
+		ClearPausedPlayers();
+	}
+	else if (messageType == "set_production_mode")
+	{
+		// Vox Deorum: Handle production mode toggle from bridge service
+		bool bEnabled = (*m_pMainThreadReadBuffer)["enabled"];
+		SetProductionMode(bEnabled);
+	}
+	else
+	{
+		// Otherwise, create echo response with original message
+		// Use the write buffer for the response
+		m_pMainThreadWriteBuffer->clear();
+		(*m_pMainThreadWriteBuffer)["type"] = "echo_response";
+		(*m_pMainThreadWriteBuffer)["original"] = messageType;  // std::string - safe copy
+		(*m_pMainThreadWriteBuffer)["timestamp"] = GetTickCount();
+		(*m_pMainThreadWriteBuffer)["turn"] = GC.getGame().getElapsedGameTurns();
+
+		// Send the response back to the Bridge Service
+		SendMessage(*m_pMainThreadWriteBuffer);
+	}
+
+	return true;
+}
+
+// Handle Lua execute command from Bridge Service
+void CvConnectionService::HandleLuaExecute(const char* script, const char* id)
+{
+	std::stringstream logMsg;
+	logMsg << "HandleLuaExecute - Executing script for id: " << id;
+	Log(LOG_DEBUG, logMsg.str().c_str());
+
+	// Handle thread locks for safe Lua execution
+	bool bHadLock = gDLL->HasGameCoreLock();
+	if (bHadLock)
+	{
+		gDLL->ReleaseGameCoreLock();
+	}
+
+	// Vox Deorum: Anything already on this state belongs to a caller further out, not to
+	// us. Record where our own results begin so ProcessLuaResult reports and pops exactly
+	// those. See its declaration for the frame this protects.
+	const int iStackBase = lua_gettop(m_pLuaState);
+
+	// Execute the Lua script using luaL_dostring (which is luaL_loadstring + lua_pcall)
+	int result = luaL_dostring(m_pLuaState, script);
+
+	// Process the Lua execution result
+	ProcessLuaResult(m_pLuaState, result, id, iStackBase);
+
+	// Restore game core lock if we had it
+	if (bHadLock)
+	{
+		gDLL->GetGameCoreLock();
+	}
+}
+
+// Handle Lua function call from Bridge Service
+void CvConnectionService::HandleLuaCall(const char* functionName, const JsonArray& args, const char* id)
+{
+	std::stringstream logMsg;
+	logMsg << "HandleLuaCall - Calling function '" << functionName << "' for id: " << id;
+	Log(LOG_DEBUG, logMsg.str().c_str());
+
+	// Look up the registered function
+	EnterCriticalSection(&m_csFunctions);
+	
+	std::map<std::string, LuaFunctionInfo>::iterator it = m_registeredFunctions.find(functionName);
+	if (it == m_registeredFunctions.end())
+	{
+		// Function not found
+		LeaveCriticalSection(&m_csFunctions);
+		
+		// Send error response using write buffer
+		m_pMainThreadWriteBuffer->clear();
+		(*m_pMainThreadWriteBuffer)["type"] = "lua_response";
+		(*m_pMainThreadWriteBuffer)["id"] = id;
+		(*m_pMainThreadWriteBuffer)["success"] = false;
+		
+		std::stringstream errorMsg;
+		errorMsg << "Function '" << functionName << "' not found";
+		(*m_pMainThreadWriteBuffer)["error"]["code"] = "INVALID_FUNCTION";
+		(*m_pMainThreadWriteBuffer)["error"]["message"] = errorMsg.str();
+		
+		SendMessage(*m_pMainThreadWriteBuffer);
+		
+		logMsg.str("");
+		logMsg << "HandleLuaCall - Function '" << functionName << "' not found";
+		Log(LOG_WARNING, logMsg.str().c_str());
+		return;
+	}
+	
+	// Get the function info
+	LuaFunctionInfo funcInfo = it->second;
+	LeaveCriticalSection(&m_csFunctions);
+	
+	// Handle thread locks for safe Lua execution
+	bool bHadLock = gDLL->HasGameCoreLock();
+	if (bHadLock)
+	{
+		gDLL->ReleaseGameCoreLock();
+	}
+	
+	// Vox Deorum: Record the frame as it stands before we push anything. This state can
+	// already be mid-call — a Lua function reached through an earlier lua_call may be
+	// sitting inside Game.CallExternal, whose wait loop is what drained us — and its
+	// arguments are on this same frame. See ProcessLuaResult's declaration.
+	const int iStackBase = lua_gettop(funcInfo.pLuaState);
+
+	// Push the function from our private registry table. If the entry is gone, answer
+	// INVALID_FUNCTION so the MCP server registers it again and retries.
+	if (!PushPrivateFunction(funcInfo.pLuaState, s_szFunctionsKey, functionName))
+	{
+		if (bHadLock)
+		{
+			gDLL->GetGameCoreLock();
+		}
+
+		m_pMainThreadWriteBuffer->clear();
+		(*m_pMainThreadWriteBuffer)["type"] = "lua_response";
+		(*m_pMainThreadWriteBuffer)["id"] = id;
+		(*m_pMainThreadWriteBuffer)["success"] = false;
+
+		std::stringstream errorMsg;
+		errorMsg << "Function '" << functionName << "' is registered but missing from the Lua registry";
+		(*m_pMainThreadWriteBuffer)["error"]["code"] = "INVALID_FUNCTION";
+		(*m_pMainThreadWriteBuffer)["error"]["message"] = errorMsg.str();
+
+		SendMessage(*m_pMainThreadWriteBuffer);
+		Log(LOG_WARNING, ("HandleLuaCall - " + errorMsg.str()).c_str());
+		return;
+	}
+
+	// Push arguments onto the Lua stack
+	int argCount = 0;
+	for (JsonArray::iterator argIt = args.begin(); argIt != args.end(); ++argIt)
+	{
+		ConvertJsonToLuaValue(funcInfo.pLuaState, *argIt);
+		argCount++;
+	}
+
+	// Call the function (argCount args, LUA_MULTRET results)
+	int result = lua_pcall(funcInfo.pLuaState, argCount, LUA_MULTRET, 0);
+
+	// Process the result
+	ProcessLuaResult(funcInfo.pLuaState, result, id, iStackBase);
+	
+	// Restore game core lock if we had it
+	if (bHadLock)
+	{
+		gDLL->GetGameCoreLock();
+	}
+}
+
+// Process the result of a Lua script execution
+void CvConnectionService::ProcessLuaResult(lua_State* L, int executionResult, const char* id, int iStackBase)
+{
+	// Build the response JSON using the write buffer
+	m_pMainThreadWriteBuffer->clear();
+	(*m_pMainThreadWriteBuffer)["type"] = "lua_response";
+	(*m_pMainThreadWriteBuffer)["id"] = id;
+
+	if (executionResult == 0)
+	{
+		// Script executed successfully
+		(*m_pMainThreadWriteBuffer)["success"] = true;
+
+		// Vox Deorum: Results are what this call left above iStackBase, never the whole
+		// frame. lua_gettop is relative to the innermost C function, so on a state already
+		// suspended inside Game.CallExternal the old whole-frame read counted that call's
+		// own arguments as results, serialized them, and then popped them out from under
+		// it — corrupting the frame it resumes into.
+		int numResults = lua_gettop(L) - iStackBase;
+		if (numResults < 0)
+		{
+			numResults = 0;
+		}
+
+		if (numResults > 0)
+		{
+			// Use the shared conversion function (starting just above the saved base)
+			ConvertLuaValuesInDocument(L, iStackBase + 1, numResults, *m_pMainThreadWriteBuffer, "result");
+		}
+
+		// Restore the frame exactly as we found it, dropping only our own results
+		lua_settop(L, iStackBase);
+
+		std::stringstream logMsg;
+		logMsg << "ProcessLuaResult - Sent success response for id: " << id << ", numResults: " << numResults;
+		Log(LOG_DEBUG, logMsg.str().c_str());
+	}
+	else
+	{
+		// Script execution failed
+		(*m_pMainThreadWriteBuffer)["success"] = false;
+
+		const char* errorMsg = lua_tostring(L, -1);
+		std::string cleanedError = CleanLuaErrorMessage(errorMsg);
+
+		(*m_pMainThreadWriteBuffer)["error"]["code"] = "LUA_EXECUTION_ERROR";
+		(*m_pMainThreadWriteBuffer)["error"]["message"] = cleanedError;
+
+		std::stringstream logMsg;
+		logMsg << "ProcessLuaResult - Sent error response for id: " << id << ", error: " << cleanedError;
+		Log(LOG_DEBUG, logMsg.str().c_str());
+
+		// Drop the error message, again leaving anything below the base untouched
+		lua_settop(L, iStackBase);
+	}
+
+	// Send the response
+	SendMessage(*m_pMainThreadWriteBuffer);
+
+	// Garbage collect
+	lua_gc(m_pLuaState, LUA_GCCOLLECT, 0);
+}
+
+// Shared function to convert Lua values to fill a key in a JsonDocument
+void CvConnectionService::ConvertLuaValuesInDocument(lua_State* L, int firstIndex, int numValues, DynamicJsonDocument& parent, const char* key)
+{
+	if (numValues <= 0)
+	{
+		// No values - set to null
+		parent[key] = (char*)0;
+	}
+	else if (numValues == 1)
+	{
+		// Single value - convert directly
+		ConvertLuaToJsonValue(L, firstIndex, parent.as<JsonObject>(), key);
+	}
+	else
+	{
+		// Multiple values - create an array
+		JsonArray resultArray;
+		resultArray = parent.createNestedArray(key);
+		
+		for (int i = 0; i < numValues; i++)
+		{
+			ConvertLuaToJsonValue(L, firstIndex + i, resultArray, (char*)0);
+		}
+	}
+}
+
+// Convert a Lua value at the given stack index to a JsonVariant
+// parent: The parent JsonVariant (object or array) that will contain this value
+// key: The key/index to use when adding to parent ((char*)0 for direct assignment)
+void CvConnectionService::ConvertLuaToJsonValue(lua_State* L, int index, JsonVariant parent, const char* key)
+{
+	// Make the index absolute if it's relative
+	if (index < 0 && index > LUA_REGISTRYINDEX)
+	{
+		index = lua_gettop(L) + index + 1;
+	}
+	
+	int type = lua_type(L, index);
+	
+	switch (type)
+	{
+	case LUA_TNIL:
+		if (key && parent.is<JsonObject>())
+		{
+			parent[key] = (char*)0;
+		}
+		else if (parent.is<JsonArray>())
+		{
+			parent.add((char*)0);
+		}
+		else
+		{
+			parent.set((char*)0);
+		}
+		break;
+		
+	case LUA_TBOOLEAN:
+		{
+			bool bValue = lua_toboolean(L, index) != 0;
+			if (key && parent.is<JsonObject>())
+			{
+				parent[key] = bValue;
+			}
+			else if (parent.is<JsonArray>())
+			{
+				parent.add(bValue);
+			}
+			else
+			{
+				parent.set(bValue);
+			}
+		}
+		break;
+		
+	case LUA_TNUMBER:
+		{
+			double num = lua_tonumber(L, index);
+			// Check if it's an integer
+			if (num == floor(num) && num >= INT_MIN && num <= INT_MAX)
+			{
+				int intNum = static_cast<int>(num);
+				if (key && parent.is<JsonObject>())
+				{
+					parent[key] = intNum;
+				}
+				else if (parent.is<JsonArray>())
+				{
+					parent.add(intNum);
+				}
+				else
+				{
+					parent.set(intNum);
+				}
+			}
+			else
+			{
+				if (key && parent.is<JsonObject>())
+				{
+					parent[key] = num;
+				}
+				else if (parent.is<JsonArray>())
+				{
+					parent.add(num);
+				}
+				else
+				{
+					parent.set(num);
+				}
+			}
+		}
+		break;
+		
+	case LUA_TSTRING:
+		{
+			const char* str = lua_tostring(L, index);
+			if (key && parent.is<JsonObject>())
+			{
+				parent[key] = (str ? str : "");
+			}
+			else if (parent.is<JsonArray>())
+			{
+				parent.add(str ? str : "");
+			}
+			else
+			{
+				parent.set(str ? str : "");
+			}
+		}
+		break;
+		
+	case LUA_TTABLE:
+		{
+			// Check if it's an array or object
+			// A Lua table is considered a JSON array ONLY if:
+			// 1. It has only numeric keys
+			// 2. All keys are positive integers
+			// 3. Keys are sequential from 1 to n with no gaps
+			bool isArray = false;
+			int maxIndex = 0;
+			bool hasNonNumericKeys = false;
+			int keyCount = 0;
+			
+			// First pass: check key types and find max index
+			lua_pushnil(L);
+			while (lua_next(L, index) != 0)
+			{
+				keyCount++;
+				// Check key type
+				if (lua_type(L, -2) == LUA_TNUMBER)
+				{
+					double keyNum = lua_tonumber(L, -2);
+					
+					// Check if it's a positive integer
+					if (keyNum == floor(keyNum) && keyNum >= 1 && keyNum <= INT_MAX)
+					{
+						int keyInt = static_cast<int>(keyNum);
+						if (keyInt > maxIndex) maxIndex = keyInt;
+					}
+				}
+				else
+				{
+					// Non-numeric key found
+					hasNonNumericKeys = true;
+				}
+				lua_pop(L, 1); // Pop value, keep key for next iteration
+			}
+			
+			// Only consider it an array if:
+			// - No non-numeric keys
+			// - Key count matches max index (no gaps)
+			// - Max index is positive
+			if (!hasNonNumericKeys && maxIndex > 0 && keyCount == maxIndex)
+			{
+				// Final check: verify all indices from 1 to maxIndex exist
+				isArray = true;
+				for (int i = 1; i <= maxIndex; i++)
+				{
+					lua_pushnumber(L, i);
+					lua_gettable(L, index);
+					if (lua_isnil(L, -1))
+					{
+						isArray = false;
+						lua_pop(L, 1);  // Pop the nil value - key was consumed by lua_gettable
+						break;
+					}
+					lua_pop(L, 1);  // Pop the value - key was consumed by lua_gettable
+				}
+			}
+			
+			if (isArray && maxIndex > 0)
+			{
+				// Create JSON array
+				JsonArray arr;
+				if (key && parent.is<JsonObject>())
+				{
+					arr = parent.as<JsonObject>().createNestedArray(key);
+				}
+				else if (parent.is<JsonArray>())
+				{
+					arr = parent.as<JsonArray>().createNestedArray();
+				}
+				else
+				{
+					arr = parent.to<JsonArray>();
+				}
+				
+				if (!arr)
+				{
+					Log(LOG_ERROR, "ConvertLuaToJsonValue - Failed to create JSON array!");
+					if (key && parent.is<JsonObject>())
+					{
+						parent[key] = (char*)0;
+					}
+					else if (parent.is<JsonArray>())
+					{
+						parent.add((char*)0);
+					}
+					else
+					{
+						parent.set((char*)0);
+					}
+					break;
+				}
+				
+				// Add elements in order (1 to maxIndex)
+				for (int i = 1; i <= maxIndex; i++)
+				{
+					lua_pushnumber(L, i);
+					lua_gettable(L, index);
+					
+					// Convert directly into the array ((char*)0 key means add to array)
+					ConvertLuaToJsonValue(L, -1, arr, (char*)0);
+					
+					lua_pop(L, 1);
+				}
+			}
+			else
+			{
+				// Create JSON object
+				JsonObject obj;
+				if (key && parent.is<JsonObject>())
+				{
+					obj = parent.as<JsonObject>().createNestedObject(key);
+				}
+				else if (parent.is<JsonArray>())
+				{
+					obj = parent.as<JsonArray>().createNestedObject();
+				}
+				else
+				{
+					obj = parent.to<JsonObject>();
+				}
+				
+				if (!obj)
+				{
+					Log(LOG_ERROR, "ConvertLuaToJsonValue - Failed to create JSON object!");
+					if (key && parent.is<JsonObject>())
+					{
+						parent[key] = (char*)0;
+					}
+					else if (parent.is<JsonArray>())
+					{
+						parent.add((char*)0);
+					}
+					else
+					{
+						parent.set((char*)0);
+					}
+					break;
+				}
+				
+				int objectKeyCount = 0;
+
+				lua_pushnil(L);
+				while (lua_next(L, index) != 0)
+				{
+					// Save the value index
+					int valueIndex = lua_gettop(L);
+					int keyIndex = valueIndex - 1;
+					
+					// Get key as string
+					const char* key = (char*)0;
+					std::string keyStorage; // Storage for dynamically created keys (per iteration)
+					
+					if (lua_type(L, keyIndex) == LUA_TSTRING)
+					{
+						key = lua_tostring(L, keyIndex);
+					}
+					else if (lua_type(L, keyIndex) == LUA_TNUMBER)
+					{
+						// Convert number to string without modifying the stack
+						double numKey = lua_tonumber(L, keyIndex);
+						std::stringstream ss;
+						if (numKey == floor(numKey))
+						{
+							ss << static_cast<int>(numKey);
+						}
+						else
+						{
+							ss << numKey;
+						}
+						keyStorage = ss.str();
+						key = keyStorage.c_str();
+					}
+					else if (lua_type(L, keyIndex) == LUA_TBOOLEAN)
+					{
+						// Convert boolean to string
+						key = lua_toboolean(L, keyIndex) ? "true" : "false";
+					}
+					else
+					{
+						// For other types, use type name as key
+						std::stringstream ss;
+						ss << "<" << lua_typename(L, lua_type(L, keyIndex)) << ">";
+						keyStorage = ss.str();
+						key = keyStorage.c_str();
+					}
+					
+					if (key)
+					{
+						objectKeyCount++;
+						// Add key-value pair to object
+						// For dynamic keys, we need to store them in the JSON object first
+						// to ensure the string remains valid during recursive calls
+						if (!keyStorage.empty())
+						{
+							// Use the string directly with ArduinoJson to ensure it makes a copy
+							obj[keyStorage] = JsonVariant();
+							ConvertLuaToJsonValue(L, valueIndex, obj[keyStorage], (char*)0);
+						}
+						else
+						{
+							// For string literals and lua strings, use the key directly
+							ConvertLuaToJsonValue(L, valueIndex, obj, key);
+						}
+					}
+					else
+					{
+						// Log warning about skipped key
+						Log(LOG_WARNING, "ConvertLuaToJsonValue - Skipped table entry with null key");
+					}
+					
+					lua_pop(L, 1); // Pop value, keep key for next iteration
+				}
+			}
+		}
+		break;
+		
+	case LUA_TFUNCTION:
+	case LUA_TUSERDATA:
+	case LUA_TTHREAD:
+	case LUA_TLIGHTUSERDATA:
+		{
+			// These types cannot be serialized to JSON - store as string description
+			std::stringstream ss;
+			ss << "<" << lua_typename(L, type) << ">";
+			if (key && parent.is<JsonObject>())
+			{
+				parent[key] = ss.str();
+			}
+			else if (parent.is<JsonArray>())
+			{
+				parent.add(ss.str());
+			}
+			else
+			{
+				parent.set(ss.str());
+			}
+		}
+		break;
+		
+	default:
+		if (key && parent.is<JsonObject>())
+		{
+			parent[key] = (char*)0;
+		}
+		else if (parent.is<JsonArray>())
+		{
+			parent.add((char*)0);
+		}
+		else
+		{
+			parent.set((char*)0);
+		}
+		break;
+	}
+}
+
+// Convert a JSON value to Lua and push it onto the stack
+void CvConnectionService::ConvertJsonToLuaValue(lua_State* L, const JsonVariant& value)
+{
+	if (value.isNull())
+	{
+		lua_pushnil(L);
+	}
+	else if (value.is<bool>())
+	{
+		lua_pushboolean(L, value.as<bool>() ? 1 : 0);
+	}
+	else if (value.is<int>())
+	{
+		lua_pushnumber(L, value.as<int>());
+	}
+	else if (value.is<double>())
+	{
+		lua_pushnumber(L, value.as<double>());
+	}
+	else if (value.is<const char*>())
+	{
+		lua_pushstring(L, value.as<const char*>());
+	}
+	else if (value.is<JsonArray>())
+	{
+		JsonArray arr = value.as<JsonArray>();
+		
+		// Create a new table
+		lua_newtable(L);
+		
+		// Add array elements
+		int index = 1;
+		for (JsonArray::iterator it = arr.begin(); it != arr.end(); ++it)
+		{
+			lua_pushnumber(L, index);
+			ConvertJsonToLuaValue(L, *it);
+			lua_settable(L, -3);
+			index++;
+		}
+	}
+	else if (value.is<JsonObject>())
+	{
+		JsonObject obj = value.as<JsonObject>();
+		
+		// Create a new table
+		lua_newtable(L);
+		
+		// Add object properties
+		for (JsonObject::iterator it = obj.begin(); it != obj.end(); ++it)
+		{
+			lua_pushstring(L, it->key().c_str());
+			ConvertJsonToLuaValue(L, it->value());
+			lua_settable(L, -3);
+		}
+	}
+	else
+	{
+		// Unknown type, push nil
+		lua_pushnil(L);
+	}
+}
+
+//------------------------------------------------------------------------------
+// Register a Lua function for external calling
+void CvConnectionService::RegisterLuaFunction(const char* name, lua_State* L, int stackIndex)
+{
+	EnterCriticalSection(&m_csFunctions);
+	
+	// Check for existing registration and clear it from the old state's table, in case it
+	// was registered from a state with a different registry
+	std::map<std::string, LuaFunctionInfo>::iterator it = m_registeredFunctions.find(name);
+	if (it != m_registeredFunctions.end())
+	{
+		ClearPrivateEntry(it->second.pLuaState, s_szFunctionsKey, name);
+
+		char buffer[512];
+		sprintf_s(buffer, sizeof(buffer), "Overwriting existing registration for function: %s", name);
+		Log(LOG_INFO, buffer);
+	}
+
+	// Store the function in our private registry table under its name
+	lua_pushvalue(L, stackIndex);
+	SetPrivateEntry(L, s_szFunctionsKey, name);
+
+	// Store the function info
+	LuaFunctionInfo info;
+	info.pLuaState = L;
+	info.strDescription = "Registered from Lua";  // Could be enhanced with optional description parameter
+	
+	m_registeredFunctions[name] = info;
+	LeaveCriticalSection(&m_csFunctions);
+	
+	// Send registration notification to Bridge
+	DynamicJsonDocument message(512);
+	message["type"] = "lua_register";
+	message["function"] = name;
+	message["description"] = info.strDescription.c_str();
+	SendMessage(message);
+	
+	char buffer[512];
+	sprintf_s(buffer, sizeof(buffer), "Registered Lua function: %s (L=%p)", name, L);
+	Log(LOG_INFO, buffer);
+}
+
+//------------------------------------------------------------------------------
+// Unregister a specific function
+void CvConnectionService::UnregisterLuaFunction(const char* name)
+{
+	EnterCriticalSection(&m_csFunctions);
+	
+	std::map<std::string, LuaFunctionInfo>::iterator it = m_registeredFunctions.find(name);
+	if (it != m_registeredFunctions.end())
+	{
+		// Clear the function from our private registry table
+		ClearPrivateEntry(it->second.pLuaState, s_szFunctionsKey, name);
+
+		// Remove from map
+		m_registeredFunctions.erase(it);
+		
+		char buffer[512];
+		sprintf_s(buffer, sizeof(buffer), "Unregistered Lua function: %s", name);
+		Log(LOG_INFO, buffer);
+	}
+	
+	LeaveCriticalSection(&m_csFunctions);
+	
+	// Send unregistration notification to Bridge
+	DynamicJsonDocument message(512);
+	message["type"] = "lua_unregister";
+	message["function"] = name;
+	SendMessage(message);
+}\
+
+//------------------------------------------------------------------------------
+// Forward game events to the Bridge Service
+void CvConnectionService::ForwardGameEvent(const char* eventName, ICvEngineScriptSystemArgs1* args)
+{
+	// Check if we're connected and ready to send
+	if (!m_bInitialized || !m_bClientConnected)
+	{
+		return;
+	}
+
+	// Define blacklisted high-frequency/useless events
+	// Since the goal here is to forward event - not to interfere with the game execution - for many kinds of events we only need one
+	static const char* eventBlacklist[] = {
+		"GameCoreUpdateBegin",
+		"GameCoreUpdateEnd",
+		"GameCoreTestVictory",
+		"PlayerPreAIUnitUpdate",
+		"BattleStarted",
+		"BattleJoined",
+		"BattleFinished",
+		"GameCoreTestVictory",
+		"PlayerEndTurnInitiated",
+		"PlayerEndTurnCompleted",
+		"UnitPrekill",
+		"GatherPerTurnReplayStats",
+		"TestEvent",
+		"TerraformingPlot",
+		"GameSave",
+		"CityPrepared",
+		"UnitGetSpecialExploreTarget",
+		"PlayerCityFounded",
+		"TeamSetHasTech",
+		"CombatEnded",
+		"BarbariansSpawnedUnit",
+		"EspionageResult",
+		"PlayerAdoptPolicyBranch",  // Skips some adoption paths; IdeologyAdopted is stored under this name instead
+		NULL  // Null terminator
+	};
+	
+	// Check if this event is blacklisted
+	for (int i = 0; eventBlacklist[i] != NULL; i++)
+	{
+		if (strcmp(eventName, eventBlacklist[i]) == 0)
+		{
+			// Process messages from the Connection Service
+			ProcessMessages();
+
+			// Skip blacklisted events
+			return;
+		}
+	}
+	
+	// Special handling for TileRevealed event - skip if from non-major civ
+	if (strcmp(eventName, "TileRevealed") == 0 && args && args->Count() >= 6)
+	{
+		// TileRevealed parameters: (iPlotX, iPlotY, iTeam, iFromTeam, bFirst, iUnitOwner, iUnit)
+		// The 6th parameter (index 5) is the unit owner (player ID)
+		// Also ignore if no unit involved (iUnitOwner == -1)
+		int iUnitOwner = -1;
+		if (args->GetInt(5, iUnitOwner) && (iUnitOwner == -1 || iUnitOwner >= MAX_MAJOR_CIVS))
+		{
+			// Skip TileRevealed events from non-major civs
+			return;
+		}
+	}
+
+	try
+	{	
+		// Generate event ID based on turn and sequence
+		unsigned long long eventId = GenerateEventId();
+		
+		// Create the message document following the new protocol
+		DynamicJsonDocument message(2048);
+		message["id"] = eventId;
+		message["type"] = "game_event";
+		message["event"] = eventName;
+		
+		// Extract arguments to JSON payload
+		JsonObject payload = message.createNestedObject("payload");
+		unsigned int argCount = 0;
+
+		// Try to parse the event using the schema
+		std::map<std::string, const char**> eventSchemas = GetEventSchemas();
+		std::map<std::string, const char**>::iterator schemaIt = eventSchemas.find(eventName);
+
+		// Check if we have both a schema and arguments to process
+		bool hasSchema = (schemaIt != eventSchemas.end());
+
+		if (args != NULL)
+		{
+			argCount = args->Count();
+
+			if (hasSchema && argCount > 0)
+			{
+				// We have a schema - parse arguments directly into named properties
+				const char** propertyNames = schemaIt->second;
+				unsigned int propIndex = 0;
+				unsigned int argIndex = 0;
+
+				while (propertyNames[propIndex] != NULL && argIndex < argCount)
+				{
+					const char* propName = propertyNames[propIndex];
+
+					// Skip type prefixes (* for array, ! for boolean) when creating JSON keys
+					if (*propName == '*' || *propName == '!') propName++;
+
+					// Arrays are represented by a count followed by items
+					if (propertyNames[propIndex][0] == '*')
+					{
+						// This is an array property - first arg is the count
+						int itemCount = 0;
+						if (args->GetInt(argIndex, itemCount))
+						{
+							argIndex++;
+							JsonArray arr = payload.createNestedArray(propName);
+
+							// Check if we have object properties following the array property
+							// The schema continues after the array property to define object fields
+							propIndex++;
+							bool hasObjectSchema = (propertyNames[propIndex] != NULL);
+
+							if (hasObjectSchema)
+							{
+								// Count how many properties the object has
+								int objectPropCount = 0;
+								int tempPropIndex = propIndex;
+								while (propertyNames[tempPropIndex] != NULL)
+								{
+									objectPropCount++;
+									tempPropIndex++;
+								}
+
+								// Read array items as objects
+								for (int i = 0; i < itemCount && argIndex < argCount; i++)
+								{
+									JsonObject obj = arr.createNestedObject();
+
+									// For each property in the object schema
+									for (int objProp = 0; objProp < objectPropCount && argIndex < argCount; objProp++)
+									{
+										const char* objPropName = propertyNames[propIndex + objProp];
+
+										// Skip type prefixes when creating JSON keys
+										if (*objPropName == '!' || *objPropName == '*') objPropName++;
+
+										// Check if this is a boolean property
+										bool isBoolProp = (propertyNames[propIndex + objProp][0] == '!');
+
+										ICvEngineScriptSystemArgs1::ArgType argType = args->GetType(argIndex);
+
+										switch (argType)
+										{
+										case ICvEngineScriptSystemArgs1::ARGTYPE_BOOL:
+											{
+												bool bValue;
+												if (args->GetBool(argIndex, bValue))
+													obj[objPropName] = bValue;
+											}
+											break;
+										case ICvEngineScriptSystemArgs1::ARGTYPE_INT:
+											{
+												int iValue;
+												if (args->GetInt(argIndex, iValue))
+												{
+													// If schema marks this as boolean but we got int, convert
+													if (isBoolProp)
+														obj[objPropName] = (iValue != 0);
+													else
+														obj[objPropName] = iValue;
+												}
+											}
+											break;
+										case ICvEngineScriptSystemArgs1::ARGTYPE_FLOAT:
+											{
+												float fValue;
+												if (args->GetFloat(argIndex, fValue))
+													obj[objPropName] = fValue;
+											}
+											break;
+										case ICvEngineScriptSystemArgs1::ARGTYPE_STRING:
+											{
+												char* szValue;
+												if (args->GetString(argIndex, szValue))
+													obj[objPropName] = szValue;
+											}
+											break;
+										case ICvEngineScriptSystemArgs1::ARGTYPE_NULL:
+											obj[objPropName] = (char*)NULL;
+											break;
+										}
+										argIndex++;
+									}
+								}
+
+								// Skip past the object properties in the schema
+								propIndex += objectPropCount - 1; // -1 because propIndex will be incremented at end of loop
+							}
+							else
+							{
+								// No object schema - read as simple array of values
+								for (int i = 0; i < itemCount && argIndex < argCount; i++)
+								{
+									// Add values based on their type
+									ICvEngineScriptSystemArgs1::ArgType argType = args->GetType(argIndex);
+
+									switch (argType)
+									{
+									case ICvEngineScriptSystemArgs1::ARGTYPE_BOOL:
+										{
+											bool bValue;
+											if (args->GetBool(argIndex, bValue))
+												arr.add(bValue);
+										}
+										break;
+									case ICvEngineScriptSystemArgs1::ARGTYPE_INT:
+										{
+											int iValue;
+											if (args->GetInt(argIndex, iValue))
+												arr.add(iValue);
+										}
+										break;
+									case ICvEngineScriptSystemArgs1::ARGTYPE_FLOAT:
+										{
+											float fValue;
+											if (args->GetFloat(argIndex, fValue))
+												arr.add(fValue);
+										}
+										break;
+									case ICvEngineScriptSystemArgs1::ARGTYPE_STRING:
+										{
+											char* szValue;
+											if (args->GetString(argIndex, szValue))
+												arr.add(szValue);
+										}
+										break;
+									case ICvEngineScriptSystemArgs1::ARGTYPE_NULL:
+										arr.add((char*)NULL);
+										break;
+									}
+									argIndex++;
+								}
+							}
+						}
+					}
+					else
+					{
+						// Check if this is a boolean property (! prefix in schema)
+						bool isBooleanProperty = (propertyNames[propIndex][0] == '!');
+
+						ICvEngineScriptSystemArgs1::ArgType argType = args->GetType(argIndex);
+
+						switch (argType)
+						{
+						case ICvEngineScriptSystemArgs1::ARGTYPE_BOOL:
+							{
+								bool bValue;
+								if (args->GetBool(argIndex, bValue))
+									payload[propName] = bValue;
+							}
+							break;
+						case ICvEngineScriptSystemArgs1::ARGTYPE_INT:
+							{
+								int iValue;
+								if (args->GetInt(argIndex, iValue))
+								{
+									// Convert integer to boolean if schema indicates boolean property
+									if (isBooleanProperty)
+									{
+										payload[propName] = (iValue != 0);
+									}
+									else
+									{
+										payload[propName] = iValue;
+									}
+								}
+							}
+							break;
+						case ICvEngineScriptSystemArgs1::ARGTYPE_FLOAT:
+							{
+								float fValue;
+								if (args->GetFloat(argIndex, fValue))
+									payload[propName] = fValue;
+							}
+							break;
+						case ICvEngineScriptSystemArgs1::ARGTYPE_STRING:
+							{
+								char* szValue;
+								if (args->GetString(argIndex, szValue))
+									payload[propName] = szValue;
+							}
+							break;
+						case ICvEngineScriptSystemArgs1::ARGTYPE_NULL:
+							payload[propName] = (char*)NULL;
+							break;
+						}
+						argIndex++;
+					}
+
+					propIndex++;
+				}
+
+				// If there are remaining arguments that weren't in the schema, log a warning
+				if (argIndex < argCount)
+				{
+					std::stringstream ss;
+					ss << "ForwardGameEvent - Warning: Event '" << eventName << "' has "
+					   << (argCount - argIndex) << " extra arguments not defined in schema (total: "
+					   << argCount << ", processed: " << argIndex << ")";
+					Log(LOG_WARNING, ss.str().c_str());
+				}
+			}
+		}
+
+		// Check if a Lua function named "!PostProcessEvent" exists and call it
+		// Look up the function in the registered functions
+		EnterCriticalSection(&m_csFunctions);
+		std::map<std::string, LuaFunctionInfo>::iterator luaIt = m_registeredFunctions.find("!PostProcessGameEvent");
+		bool hasPostProcessor = (luaIt != m_registeredFunctions.end());
+		LuaFunctionInfo postProcessorInfo;
+		if (hasPostProcessor)
+		{
+			postProcessorInfo = luaIt->second;
+		}
+		LeaveCriticalSection(&m_csFunctions);
+
+		if (hasPostProcessor)
+		{
+			// Call the Lua function with eventName and payload
+			bool bHadLock = gDLL->HasGameCoreLock();
+			if (bHadLock)
+			{
+				gDLL->ReleaseGameCoreLock();
+			}
+
+			// Push the function from our private registry table, skipping post-processing
+			// if the entry is gone
+			bool bHasFunction = PushPrivateFunction(postProcessorInfo.pLuaState, s_szFunctionsKey, "!PostProcessGameEvent");
+			int result = 0;
+			if (bHasFunction)
+			{
+				// Push arguments: eventName (string) and payload (table)
+				lua_pushstring(postProcessorInfo.pLuaState, eventName);
+
+				// Convert JSON payload to Lua table
+				ConvertJsonToLuaValue(postProcessorInfo.pLuaState, payload);
+
+				// Call the function (2 args, 2 results)
+				result = lua_pcall(postProcessorInfo.pLuaState, 2, 2, 0);
+			}
+
+			if (!bHasFunction)
+			{
+				Log(LOG_WARNING, "ForwardGameEvent - !PostProcessGameEvent is registered but missing from the Lua registry, skipping post-processing");
+			}
+			else if (result == 0)
+			{
+				// Success - get the return values
+				// First return value: extraPayload
+				if (!lua_isnil(postProcessorInfo.pLuaState, -2))
+				{
+					// Convert first return value to JSON and store as extraPayload
+					ConvertLuaToJsonValue(postProcessorInfo.pLuaState, -2, message.as<JsonObject>(), "extraPayload");
+				}
+
+				// Second return value: visibility
+				if (!lua_isnil(postProcessorInfo.pLuaState, -1))
+				{
+					// Convert second return value to JSON and store as visibility
+					ConvertLuaToJsonValue(postProcessorInfo.pLuaState, -1, message.as<JsonObject>(), "visibility");
+				}
+
+				// Pop both return values
+				lua_pop(postProcessorInfo.pLuaState, 2);
+			}
+			else
+			{
+				// Error - log warning and continue
+				const char* errorMsg = lua_tostring(postProcessorInfo.pLuaState, -1);
+				std::string cleanedError = CleanLuaErrorMessage(errorMsg);
+
+				std::stringstream logMsg;
+				logMsg << "ForwardGameEvent - !PostProcessEvent failed for event '" << eventName << "': " << cleanedError;
+				Log(LOG_WARNING, logMsg.str().c_str());
+
+				// Pop the error message
+				lua_pop(postProcessorInfo.pLuaState, 1);
+			}
+
+			// Restore game core lock if we had it
+			if (bHadLock)
+			{
+				gDLL->GetGameCoreLock();
+			}
+		}
+
+		if (message.overflowed())
+		{
+			std::stringstream ss;
+			ss << "ForwardGameEvent - Refusing overflowed event '" << eventName << "'";
+			Log(LOG_ERROR, ss.str().c_str());
+		}
+		else if (hasSchema)
+		{
+
+			std::stringstream ss;
+			ss << "ForwardGameEvent - Forwarding event '" << eventName << "' with arguments " << argCount;
+			Log(LOG_DEBUG, ss.str().c_str());
+
+			// Send the message asynchronously via the queue
+			if (SendMessage(message) >= 5) {
+				// Vox Deorum: Release game core lock during throttle sleep to avoid
+				// blocking the UI thread for 20ms (which increases lock contention)
+				bool bHadLock = gDLL->HasGameCoreLock();
+				if (bHadLock)
+				{
+					gDLL->ReleaseGameCoreLock();
+				}
+				Sleep(20);
+				if (bHadLock)
+				{
+					gDLL->GetGameCoreLock();
+				}
+			}
+		}
+		else
+		{
+			// No schema found or no args - skip it
+			std::stringstream ss;
+			ss << "ForwardGameEvent - Skipping event '" << eventName << "' with arguments " << argCount;
+			Log(LOG_DEBUG, ss.str().c_str());
+		}
+	}
+	catch (...)
+	{
+		std::stringstream ss;
+		ss << "ForwardGameEvent - Unknown exception forwarding event '" << eventName << "'";
+		Log(LOG_ERROR, ss.str().c_str());
+	}
+	
+	// Process messages from the Connection Service
+	ProcessMessages();
+}
+
+// Vox Deorum: Broadcast a custom game event from C++ through the IPC pipe.
+void CvConnectionService::BroadcastEvent(const char* eventName, const DynamicJsonDocument& payload)
+{
+	DynamicJsonDocument message(65536);
+	message["type"] = "game_event";
+	message["event"] = eventName;
+	message["payload"] = payload.as<JsonVariantConst>();
+	if (message.overflowed())
+	{
+		std::stringstream ss;
+		ss << "BroadcastEvent - Refusing overflowed event '" << eventName << "'";
+		Log(LOG_ERROR, ss.str().c_str());
+		return;
+	}
+	SendMessage(message);
+}
+
+// Vox Deorum: Broadcast a custom game event from Lua through the IPC pipe.
+// Lua args: eventName (string, required), payload (table, optional)
+int CvConnectionService::BroadcastEventFromLua(lua_State* L)
+{
+	const char* eventName = luaL_checkstring(L, 1);
+	DynamicJsonDocument message(65536);
+	message["type"] = "game_event";
+	message["event"] = eventName;
+	if (lua_istable(L, 2)) {
+		JsonObject payloadObj = message.createNestedObject("payload");
+		ConvertLuaToJsonValue(L, 2, payloadObj, NULL);
+	}
+	// Vox Deorum: when the caller passes a truthy third argument, attach a real
+	// turn-scoped event id (turn * 1000000 + sequence) exactly as ForwardGameEvent
+	// does. This lets the event flow through the mcp-server's id-based handling
+	// (turn tracking, the lastID resume marker, resync, and the GameEvents primary
+	// key) instead of being treated as an id-less broadcast. Off by default: most
+	// Lua broadcasts (e.g. the render events VoxDeorumTest fires) are intentionally
+	// id-less and are stored out of the main event stream. Safe to call here: Lua
+	// executes on the main thread, the same thread GenerateEventId/ForwardGameEvent
+	// run on, so the shared event-sequence counter is never touched concurrently.
+	if (lua_toboolean(L, 3)) {
+		message["id"] = GenerateEventId();
+	}
+	if (message.overflowed())
+	{
+		std::stringstream ss;
+		ss << "BroadcastEventFromLua - Refusing overflowed event '" << eventName << "'";
+		Log(LOG_ERROR, ss.str().c_str());
+		return luaL_error(L, "Vox Deorum could not broadcast '%s': payload exceeds the 64 KB event pool", eventName);
+	}
+	SendMessage(message);
+	return 0;
+}
+
+// Register an external function that can be called from Lua
+void CvConnectionService::RegisterExternalFunction(const char* name, bool bAsync)
+{
+	if (!name || strlen(name) == 0)
+	{
+		Log(LOG_WARNING, "RegisterExternalFunction - Invalid function name");
+		return;
+	}
+
+	EnterCriticalSection(&m_csExternalFunctions);
+	
+	// Check if already registered
+	std::map<std::string, ExternalFunctionInfo>::iterator it = m_externalFunctions.find(name);
+	if (it != m_externalFunctions.end())
+	{
+		// Update existing registration
+		it->second.bAsync = bAsync;
+		it->second.bRegistered = true;
+		
+		std::stringstream ss;
+		ss << "RegisterExternalFunction - Updated existing registration for '" << name << "'";
+		Log(LOG_DEBUG, ss.str().c_str());
+	}
+	else
+	{
+		// Add new registration
+		ExternalFunctionInfo info;
+		info.strName = name;
+		info.bAsync = bAsync;
+		info.bRegistered = true;
+		
+		m_externalFunctions[name] = info;
+		
+		std::stringstream ss;
+		ss << "RegisterExternalFunction - Added new registration for '" << name << "'";
+		Log(LOG_DEBUG, ss.str().c_str());
+	}
+	
+	LeaveCriticalSection(&m_csExternalFunctions);
+}
+
+// Unregister an external function
+void CvConnectionService::UnregisterExternalFunction(const char* name)
+{
+	if (!name || strlen(name) == 0)
+	{
+		Log(LOG_WARNING, "UnregisterExternalFunction - Invalid function name");
+		return;
+	}
+	EnterCriticalSection(&m_csExternalFunctions);
+	
+	std::map<std::string, ExternalFunctionInfo>::iterator it = m_externalFunctions.find(name);
+	if (it != m_externalFunctions.end())
+	{
+		// Remove the registration
+		m_externalFunctions.erase(it);
+		
+		std::stringstream ss;
+		ss << "UnregisterExternalFunction - Successfully unregistered '" << name << "'";
+		Log(LOG_DEBUG, ss.str().c_str());
+	}
+	else
+	{
+		std::stringstream ss;
+		ss << "UnregisterExternalFunction - Function '" << name << "' was not registered";
+		Log(LOG_WARNING, ss.str().c_str());
+	}
+	
+	LeaveCriticalSection(&m_csExternalFunctions);
+}
+
+// Check if an external function is registered
+bool CvConnectionService::IsExternalFunctionRegistered(const char* name) const
+{
+	if (!name || strlen(name) == 0)
+	{
+		return false;
+	}
+
+	EnterCriticalSection(const_cast<CRITICAL_SECTION*>(&m_csExternalFunctions));
+	
+	bool bRegistered = false;
+	std::map<std::string, ExternalFunctionInfo>::const_iterator it = m_externalFunctions.find(name);
+	if (it != m_externalFunctions.end())
+	{
+		bRegistered = it->second.bRegistered;
+	}
+	
+	LeaveCriticalSection(const_cast<CRITICAL_SECTION*>(&m_csExternalFunctions));
+	
+	return bRegistered;
+}
+
+// Generate a unique call ID for async external function calls
+std::string CvConnectionService::GenerateCallId()
+{
+	// Use a combination of thread ID, tick count, and counter to ensure uniqueness
+	std::stringstream ss;
+	ss << "call_" << GetCurrentThreadId() << "_" << GetTickCount() << "_" << m_uiNextCallId++;
+	return ss.str();
+}
+
+// Generate event ID based on turn and sequence
+unsigned long long CvConnectionService::GenerateEventId()
+{
+	// Get current turn from the game
+	unsigned int currentTurn = 0;
+	currentTurn = GC.getGame().getGameTurn();
+	
+	// If turn has changed, reset event sequence
+	if (currentTurn != m_uiCurrentTurn)
+	{
+		m_uiCurrentTurn = currentTurn;
+		m_uiEventSequence = 1;
+	}
+	
+	// Generate event ID: (turn * 1000000) + eventSequence
+	unsigned long long eventId = (unsigned long long)m_uiCurrentTurn * 1000000ULL + m_uiEventSequence;
+	
+	// Increment sequence for next event
+	m_uiEventSequence++;
+	
+	return eventId;
+}
+
+// Serialize m_uiEventSequence to database
+void CvConnectionService::SerializeEventSequence()
+{
+	// Build Lua script to save event sequence
+	std::stringstream script;
+	script << "local saveDB = Modding.OpenSaveData();\n";
+	script << "-- Create table if not exists\n";
+	script << "for row in saveDB.Query('CREATE TABLE IF NOT EXISTS Deorum(\"ID\" INTEGER NOT NULL PRIMARY KEY, \"Key\" TEXT, \"Value\" TEXT)') do end\n";
+	script << "-- Update or insert EventSequence value\n";
+	script << "for row in saveDB.Query(\"DELETE FROM Deorum WHERE Key == 'EventSequence'\") do end\n";
+	script << "for row in saveDB.Query(\"INSERT INTO Deorum (Key, Value) VALUES ('EventSequence', ?)\", tostring(" << m_uiEventSequence << ")) do end\n";
+
+	// Vox Deorum: Must release game core lock before Lua execution to prevent
+	// ABBA deadlock with the UI thread (which holds LuaLock and may need GameCoreLock)
+	bool bHadLock = gDLL->HasGameCoreLock();
+	if (bHadLock)
+	{
+		gDLL->ReleaseGameCoreLock();
+	}
+
+	// Execute the script
+	int result = luaL_dostring(m_pLuaState, script.str().c_str());
+
+	if (result != 0)
+	{
+		const char* errorMsg = lua_tostring(m_pLuaState, -1);
+		std::string cleanedError = CleanLuaErrorMessage(errorMsg);
+		std::stringstream ss;
+		ss << "SerializeEventSequence - Failed to save: " << cleanedError;
+		Log(LOG_ERROR, ss.str().c_str());
+		lua_pop(m_pLuaState, 1);
+	}
+	else
+	{
+		std::stringstream ss;
+		ss << "SerializeEventSequence - Saved event sequence: " << m_uiEventSequence;
+		Log(LOG_DEBUG, ss.str().c_str());
+	}
+
+	// Restore game core lock if we had it
+	if (bHadLock)
+	{
+		gDLL->GetGameCoreLock();
+	}
+}
+
+// Read the persisted game UUID from the Deorum save-data table for
+// recording capture identity. Follows the same lock ordering as the event
+// sequence helpers: the game core lock is released around Lua execution.
+bool CvConnectionService::TryReadGameUuid(std::string& uuidText)
+{
+	uuidText.clear();
+	if (m_pLuaState == NULL)
+	{
+		return false;
+	}
+	const char* script =
+		"local saveDB = Modding.OpenSaveData();\n"
+		"local gameId = nil;\n"
+		"for row in saveDB.Query(\"SELECT Value FROM Deorum WHERE Key == 'GameID'\") do\n"
+		"  gameId = row.Value;\n"
+		"  break;\n"
+		"end\n"
+		"return gameId;\n";
+
+	// Vox Deorum: Must release game core lock before Lua execution to prevent
+	// ABBA deadlock with the UI thread (which holds LuaLock and may need GameCoreLock)
+	bool bHadLock = gDLL->HasGameCoreLock();
+	if (bHadLock)
+	{
+		gDLL->ReleaseGameCoreLock();
+	}
+
+	int result = luaL_dostring(m_pLuaState, script);
+	bool found = false;
+	if (result != 0)
+	{
+		const char* errorMsg = lua_tostring(m_pLuaState, -1);
+		std::string cleanedError = CleanLuaErrorMessage(errorMsg);
+		std::stringstream ss;
+		ss << "TryReadGameUuid - Failed to load: " << cleanedError;
+		Log(LOG_ERROR, ss.str().c_str());
+		lua_pop(m_pLuaState, 1);
+	}
+	else
+	{
+		if (lua_isstring(m_pLuaState, -1))
+		{
+			const char* valueStr = lua_tostring(m_pLuaState, -1);
+			if (valueStr != NULL && valueStr[0] != '\0')
+			{
+				uuidText = valueStr;
+				found = true;
+			}
+		}
+		lua_pop(m_pLuaState, 1);
+	}
+
+	if (bHadLock)
+	{
+		gDLL->GetGameCoreLock();
+	}
+	return found;
+}
+
+// Deserialize m_uiEventSequence from database
+void CvConnectionService::DeserializeEventSequence()
+{
+	// Build Lua script to load event sequence
+	const char* script =
+		"local saveDB = Modding.OpenSaveData();\n"
+		"-- Create table if not exists\n"
+		"for row in saveDB.Query('CREATE TABLE IF NOT EXISTS Deorum(\"ID\" INTEGER NOT NULL PRIMARY KEY, \"Key\" TEXT, \"Value\" TEXT)') do end\n"
+		"-- Try to get existing EventSequence\n"
+		"local eventSequence = nil;\n"
+		"for row in saveDB.Query(\"SELECT Value FROM Deorum WHERE Key == 'EventSequence'\") do\n"
+		"  eventSequence = row.Value;\n"
+		"  break;\n"
+		"end\n"
+		"return eventSequence;\n";
+
+	// Vox Deorum: Must release game core lock before Lua execution to prevent
+	// ABBA deadlock with the UI thread (which holds LuaLock and may need GameCoreLock)
+	bool bHadLock = gDLL->HasGameCoreLock();
+	if (bHadLock)
+	{
+		gDLL->ReleaseGameCoreLock();
+	}
+
+	// Execute the script
+	int result = luaL_dostring(m_pLuaState, script);
+
+	if (result != 0)
+	{
+		const char* errorMsg = lua_tostring(m_pLuaState, -1);
+		std::string cleanedError = CleanLuaErrorMessage(errorMsg);
+		std::stringstream ss;
+		ss << "DeserializeEventSequence - Failed to load: " << cleanedError;
+		Log(LOG_ERROR, ss.str().c_str());
+		lua_pop(m_pLuaState, 1);
+	}
+	else
+	{
+		// Check if we got a result
+		if (lua_isstring(m_pLuaState, -1))
+		{
+			const char* valueStr = lua_tostring(m_pLuaState, -1);
+			if (valueStr)
+			{
+				unsigned int loadedValue = (unsigned int)atoi(valueStr);
+				if (loadedValue > 0)
+				{
+					m_uiEventSequence = loadedValue;
+				}
+			}
+		}
+		lua_pop(m_pLuaState, 1);
+	}
+
+	// Restore game core lock if we had it
+	if (bHadLock)
+	{
+		gDLL->GetGameCoreLock();
+	}
+
+	std::stringstream ss;
+	ss << "DeserializeEventSequence - Loaded event sequence: " << m_uiEventSequence;
+	Log(LOG_DEBUG, ss.str().c_str());
+}
+
+// Vox Deorum: Helper to clean Lua error messages by removing script location prefixes
+std::string CvConnectionService::CleanLuaErrorMessage(const char* errorMsg)
+{
+	if (!errorMsg) return "Unknown Lua error";
+
+	std::string cleanedError = errorMsg;
+
+	// Remove script location prefix (e.g., "summaries:82:" from "summaries:82:error message")
+	// Find the last colon in the string
+	size_t lastColon = cleanedError.rfind(':');
+	if (lastColon != std::string::npos && lastColon > 0) {
+		// Find the second-to-last colon
+		size_t secondLastColon = cleanedError.rfind(':', lastColon - 1);
+		if (secondLastColon != std::string::npos) {
+			// Keep everything after the second-to-last colon, trimming leading space
+			cleanedError = cleanedError.substr(secondLastColon + 1);
+			// Trim leading space if present
+			if (!cleanedError.empty() && cleanedError[0] == ' ') {
+				cleanedError = cleanedError.substr(1);
+			}
+		}
+	}
+
+	return cleanedError;
+}
+
+// Callback data structure for Lua external calls
+// The callback function lives in the "VoxDeorum.Callbacks" registry table under strCallId.
+struct LuaExternalCallbackData {
+	lua_State* L;
+	std::string strCallId;
+};
+
+// Static callback function for external calls
+void CvConnectionService::HandleExternalCallCallback(const ExternalCallResult& result, void* userData)
+{
+	LuaExternalCallbackData* pData = (LuaExternalCallbackData*)userData;
+	if (pData && pData->L)
+	{
+		// Vox Deorum: Must release game core lock before Lua execution to prevent
+		// ABBA deadlock with the UI thread (which holds LuaLock and may need GameCoreLock)
+		bool bHadLock = gDLL->HasGameCoreLock();
+		if (bHadLock)
+		{
+			gDLL->ReleaseGameCoreLock();
+		}
+
+		// Get the callback function from our private registry table
+		if (PushPrivateFunction(pData->L, s_szCallbacksKey, pData->strCallId.c_str()))
+		{
+			// Use shared post-processing
+			CvConnectionService::GetInstance().ProcessExternalCallResult(pData->L, result);
+
+			// Call the callback with 2 arguments (result/nil, error)
+			if (lua_pcall(pData->L, 2, 0, 0) != 0)
+			{
+				// Log error but don't propagate
+				const char* error = lua_tostring(pData->L, -1);
+				std::stringstream logMsg;
+				logMsg << "Error in external call callback: " << (error ? error : "unknown");
+				CvConnectionService::GetInstance().Log(CvConnectionService::LOG_ERROR, logMsg.str().c_str());
+				lua_pop(pData->L, 1);  // Remove error from stack
+			}
+		}
+		else
+		{
+			std::stringstream logMsg;
+			logMsg << "External call callback for " << pData->strCallId << " is missing from the Lua registry";
+			CvConnectionService::GetInstance().Log(CvConnectionService::LOG_WARNING, logMsg.str().c_str());
+		}
+
+		// Clean up the callback entry
+		ClearPrivateEntry(pData->L, s_szCallbacksKey, pData->strCallId.c_str());
+
+		// Restore game core lock if we had it
+		if (bHadLock)
+		{
+			gDLL->GetGameCoreLock();
+		}
+
+		// Clean up the callback data
+		delete pData;
+	}
+}
+
+// Call an external function (callback extracted from Lua state if present)
+int CvConnectionService::CallExternalFunction(lua_State* L)
+{
+	ExternalCallResult result;
+	result.bSuccess = false;
+	
+	// Validate Lua state
+	if (!L)
+	{
+		Log(LOG_ERROR, "CallExternalFunction - Invalid Lua state provided");
+		return 0;
+	}
+	
+	// Get function name from first argument
+	if (!lua_isstring(L, 1))
+	{
+		Log(LOG_ERROR, "CallExternalFunction - First argument must be a function name string");
+		lua_pushnil(L);
+		lua_pushstring(L, "First argument must be a function name string");
+		return 2;  // Pushed nil and error message
+	}
+	const char* functionName = lua_tostring(L, 1);
+	
+	// Check if last argument is a callback function (for async calls)
+	int numArgs = lua_gettop(L);
+	const int callbackIndex = numArgs;
+	bool hasCallback = (numArgs >= 2 && lua_isfunction(L, numArgs));
+	ExternalCallCallback callback = NULL;
+	void* userData = NULL;
+
+	if (hasCallback)
+	{
+		// Don't include callback in arguments count
+		numArgs--;
+	}
+
+	// Validate the call
+	if (!ValidateExternalCall(functionName, result))
+	{
+		// For async calls, call the callback with an error immediately, straight from the
+		// stack. Validation fails whenever the service is not initialized, so nothing touches
+		// the callback table before Setup has created it.
+		if (hasCallback)
+		{
+			lua_pushvalue(L, callbackIndex);
+			ProcessExternalCallResult(L, result);
+			if (lua_pcall(L, 2, 0, 0) != 0)
+			{
+				const char* error = lua_tostring(L, -1);
+				std::stringstream logMsg;
+				logMsg << "Error in external call callback: " << (error ? error : "unknown");
+				Log(LOG_ERROR, logMsg.str().c_str());
+				lua_pop(L, 1);  // Remove error from stack
+			}
+			return 0;
+		}
+		// For sync calls, push error to Lua stack
+		else
+		{
+			lua_pushnil(L);
+			lua_pushstring(L, result.strError.c_str());
+			return 2;  // Pushed nil and error message
+		}
+	}
+
+	// Generate unique call ID (async callbacks are stored under it)
+	std::string callId = GenerateCallId();
+
+	if (hasCallback)
+	{
+		// Create callback data
+		LuaExternalCallbackData* pCallbackData = new LuaExternalCallbackData;
+		pCallbackData->L = L;
+		pCallbackData->strCallId = callId;
+
+		// Store the callback function in our private registry table under the call ID
+		lua_pushvalue(L, callbackIndex);
+		SetPrivateEntry(L, s_szCallbacksKey, callId.c_str());
+
+		// Set the callback function pointer
+		callback = HandleExternalCallCallback;
+		userData = pCallbackData;
+	}
+
+	// Create a pending call entry
+	PendingExternalCall pendingCall;
+	pendingCall.strCallId = callId;
+	pendingCall.strFunctionName = functionName;
+	pendingCall.pCallback = callback;
+	pendingCall.pUserData = userData;
+	pendingCall.dwTimestamp = GetTickCount();
+	
+	// Add to pending calls map
+	EnterCriticalSection(&m_csPendingCalls);
+	m_pendingExternalCalls[callId] = pendingCall;
+	LeaveCriticalSection(&m_csPendingCalls);
+	
+	// Create the call request message
+	DynamicJsonDocument request(8192);
+	request["type"] = "external_call";
+	request["id"] = callId;
+	request["function"] = functionName;
+	request["async"] = hasCallback;
+	
+	// Convert Lua arguments directly to JSON without intermediate string serialization
+	// Important: numArgs was already decremented if there was a callback, so it doesn't include the callback
+	// Arguments start at index 2 (after function name at index 1)
+	int actualArgCount = numArgs - 1;  // Exclude function name
+	if (actualArgCount > 0)
+	{
+		// Use the shared conversion function to convert Lua values directly to JsonVariant
+		ConvertLuaValuesInDocument(L, 2, actualArgCount, request, "args");
+	}
+	
+	// Send the request
+	SendMessage(request);
+	
+	std::stringstream logMsg;
+	logMsg << "CallExternalFunction - Sent request for '" << functionName << "' with ID " << callId;
+	Log(LOG_DEBUG, logMsg.str().c_str());
+	
+	// For synchronous calls, wait for the result
+	if (!hasCallback)
+	{
+		// Wait for the result to be available in m_syncCallResults
+		const DWORD maxWaitTime = 1000; // 1 second timeout
+		const DWORD startTime = GetTickCount();
+		ExternalCallResult syncResult;
+		bool resultFound = false;
+		
+		while (!resultFound && (GetTickCount() - startTime) < maxWaitTime)
+		{
+			// Vox Deorum: Drain reentrantly. A synchronous external call made from a Lua
+			// function that the bridge itself invoked (lua_call -> handler -> CallExternal)
+			// runs inside an active drain, and the ordinary guard would refuse this pump —
+			// leaving the only code path that can route our external_response blocked until
+			// the timeout below fires.
+			DrainIncomingMessages(DRAIN_AWAIT);
+			Sleep(10); // Wait 10ms before checking again
+
+			EnterCriticalSection(&m_csPendingCalls);
+			std::map<std::string, ExternalCallResult>::iterator resultIt = m_syncCallResults.find(callId);
+			if (resultIt != m_syncCallResults.end())
+			{
+				syncResult = resultIt->second;
+				m_syncCallResults.erase(resultIt); // Clean up the result
+				resultFound = true;
+			}
+			LeaveCriticalSection(&m_csPendingCalls);
+		}
+		
+		// Push result to Lua stack
+		if (resultFound)
+		{
+			// Use shared post-processing which always pushes 2 values (result, error)
+			ProcessExternalCallResult(L, syncResult);
+			
+			// Always return 2 (result and error/nil)
+			return 2;
+		}
+		else
+		{
+			// Timeout occurred
+			lua_pushnil(L);
+			lua_pushstring(L, "CALL_TIMEOUT");
+			
+			// Clean up the pending call since it timed out
+			EnterCriticalSection(&m_csPendingCalls);
+			std::map<std::string, PendingExternalCall>::iterator pendingIt = m_pendingExternalCalls.find(callId);
+			if (pendingIt != m_pendingExternalCalls.end())
+			{
+				// Clean up callback data if present (should not happen for sync calls, but be safe)
+				if (pendingIt->second.pUserData && pendingIt->second.pCallback)
+				{
+					LuaExternalCallbackData* pCallbackData =
+						static_cast<LuaExternalCallbackData*>(pendingIt->second.pUserData);
+					if (pCallbackData && pCallbackData->L)
+					{
+						ClearPrivateEntry(pCallbackData->L, s_szCallbacksKey, pCallbackData->strCallId.c_str());
+						delete pCallbackData;
+					}
+				}
+				m_pendingExternalCalls.erase(pendingIt);
+			}
+			LeaveCriticalSection(&m_csPendingCalls);
+			
+			std::stringstream timeoutMsg;
+			timeoutMsg << "CallExternalFunction - Timeout waiting for response to '" << functionName << "' (ID: " << callId << ")";
+			Log(LOG_WARNING, timeoutMsg.str().c_str());
+			
+			return 2;  // Pushed nil and error message
+		}
+	}
+	else
+	{
+		// Async call - callback will handle the result later
+		// IMPORTANT: We must clean up the Lua stack since we're returning 0
+		// The original arguments are still on the stack and need to be removed
+		// We have: function_name, arg1, arg2, ..., argN (callback was already removed from count)
+		// Total items to pop: numArgs (which includes function name but excludes callback)
+		lua_pop(L, numArgs);
+	}
+	
+	// Async call - no values pushed (callback will handle the result)
+	return 0;
+}
+
+// Handle external call response from the Bridge Service
+void CvConnectionService::HandleExternalCallResponse(const char* callId, bool bSuccess, const char* error, const char* data)
+{
+	if (!callId)
+	{
+		Log(LOG_ERROR, "HandleExternalCallResponse - Invalid call ID");
+		return;
+	}
+	
+	// Look up the pending call
+	EnterCriticalSection(&m_csPendingCalls);
+	
+	std::map<std::string, PendingExternalCall>::iterator it = m_pendingExternalCalls.find(callId);
+	if (it == m_pendingExternalCalls.end())
+	{
+		LeaveCriticalSection(&m_csPendingCalls);
+		
+		std::stringstream ss;
+		ss << "HandleExternalCallResponse - No pending call found for ID: " << callId;
+		Log(LOG_WARNING, ss.str().c_str());
+		return;
+	}
+	
+	// Get the pending call info
+	PendingExternalCall pendingCall = it->second;
+	
+	// Prepare the result
+	ExternalCallResult result;
+	result.bSuccess = bSuccess;
+	result.strError = error ? error : "";
+	result.strData = data ? data : "";
+	
+	// Log the response
+	std::stringstream logMsg;
+	logMsg << "HandleExternalCallResponse - Received response for '" << pendingCall.strFunctionName 
+	       << "' (ID: " << callId << ", Success: " << (bSuccess ? "true" : "false") << ", Error: " << result.strError << ")";
+	Log(LOG_DEBUG, logMsg.str().c_str());
+	
+	// Check if this is a sync or async call
+	if (pendingCall.pCallback)
+	{
+		// Async call - remove from pending and invoke callback
+		m_pendingExternalCalls.erase(it);
+		LeaveCriticalSection(&m_csPendingCalls);
+		
+		// Call the callback outside of critical section
+		pendingCall.pCallback(result, pendingCall.pUserData);
+	}
+	else
+	{
+		// Sync call - store the result for the waiting thread
+		m_syncCallResults[callId] = result;
+		m_pendingExternalCalls.erase(it);
+		LeaveCriticalSection(&m_csPendingCalls);
+	}
+}
+
+// Helper function to validate external call parameters and state
+bool CvConnectionService::ValidateExternalCall(const char* functionName, ExternalCallResult& result)
+{
+	// Check if service is initialized and connected
+	if (!m_bInitialized || !m_bClientConnected)
+	{
+		result.bSuccess = false;
+		result.strError = "DLL_DISCONNECTED";
+		Log(LOG_WARNING, "ValidateExternalCall - Service not connected");
+		return false;
+	}
+	
+	// Check if function is registered
+	EnterCriticalSection(&m_csExternalFunctions);
+	std::map<std::string, ExternalFunctionInfo>::iterator it = m_externalFunctions.find(functionName);
+	bool bRegistered = (it != m_externalFunctions.end() && it->second.bRegistered);
+	LeaveCriticalSection(&m_csExternalFunctions);
+	
+	if (!bRegistered)
+	{
+		std::stringstream ss;
+		result.bSuccess = false;
+		result.strError = "INVALID_FUNCTION";
+		ss << "External function '" << functionName << "' is not registered";
+		Log(LOG_WARNING, result.strError.c_str());
+		return false;
+	}
+	
+	return true;
+}
+
+// Shared post-processing function for external call results
+// IMPORTANT: This function ALWAYS pushes exactly 2 values to the Lua stack:
+// 1. Result value (or nil on error)
+// 2. Error message (or nil on success)
+void CvConnectionService::ProcessExternalCallResult(lua_State* L, const ExternalCallResult& result)
+{
+	if (result.bSuccess)
+	{
+		// Parse JSON result and push to Lua
+		if (!result.strData.empty())
+		{
+			DynamicJsonDocument doc(8192);
+			DeserializationError error = deserializeJson(doc, result.strData);
+			
+			if (!error)
+			{
+				// Convert JSON to Lua value - push result and nil (no error)
+				ConvertJsonToLuaValue(L, doc.as<JsonVariant>());
+				lua_pushnil(L);  // No error
+			}
+			else
+			{
+				// JSON parsing failed - push nil and error message
+				lua_pushnil(L);
+				lua_pushstring(L, "SERIALIZATION_ERROR");
+				std::stringstream errorMsg;
+				errorMsg << "Failed to parse JSON result: " << error.c_str();
+			}
+		}
+		else
+		{
+			// No data, push nil result and nil error
+			lua_pushnil(L);
+			lua_pushnil(L);  // No error
+		}
+	}
+	else
+	{
+		// Call failed, push nil and error message
+		lua_pushnil(L);
+		lua_pushstring(L, result.strError.c_str());
+	}
+}
+
+// Vox Deorum: Add a player to the paused players list
+void CvConnectionService::AddPausedPlayer(int iPlayerID)
+{
+	EnterCriticalSection(&m_csPausedPlayers);
+	m_pausedPlayers.insert(iPlayerID);
+	LeaveCriticalSection(&m_csPausedPlayers);
+
+	std::stringstream ss;
+	ss << "AddPausedPlayer - Player " << iPlayerID << " added to paused list";
+	Log(LOG_DEBUG, ss.str().c_str());
+}
+
+// Vox Deorum: Remove a player from the paused players list
+void CvConnectionService::RemovePausedPlayer(int iPlayerID)
+{
+	EnterCriticalSection(&m_csPausedPlayers);
+	m_pausedPlayers.erase(iPlayerID);
+	LeaveCriticalSection(&m_csPausedPlayers);
+
+	std::stringstream ss;
+	ss << "RemovePausedPlayer - Player " << iPlayerID << " removed from paused list";
+	Log(LOG_DEBUG, ss.str().c_str());
+}
+
+// Vox Deorum: Clear all paused players
+void CvConnectionService::ClearPausedPlayers()
+{
+	EnterCriticalSection(&m_csPausedPlayers);
+	m_pausedPlayers.clear();
+	LeaveCriticalSection(&m_csPausedPlayers);
+
+	Log(LOG_DEBUG, "ClearPausedPlayers - All players removed from paused list");
+}
+
+// Check if game core should be paused
+bool CvConnectionService::ShouldPauseGameCore()
+{
+	// Double-check we're still initialized and connected
+	if (!m_bInitialized || !m_bClientConnected) return false;
+	
+	// First check if there are any paused players
+	EnterCriticalSection(const_cast<CRITICAL_SECTION*>(&m_csPausedPlayers));
+	if (m_pausedPlayers.empty())
+	{
+		LeaveCriticalSection(const_cast<CRITICAL_SECTION*>(&m_csPausedPlayers));
+		return false;
+	}
+
+	// Check all players who are currently active (handles both regular and simultaneous turns)
+	for (int iPlayer = 0; iPlayer < MAX_MAJOR_CIVS; iPlayer++)
+	{
+		CvPlayer& player = GET_PLAYER((PlayerTypes)iPlayer);
+		if (player.isAlive() && player.isTurnActive())
+		{
+			// Check if this active player is in the paused players list
+			if (m_pausedPlayers.find(iPlayer) != m_pausedPlayers.end())
+			{
+				LeaveCriticalSection(const_cast<CRITICAL_SECTION*>(&m_csPausedPlayers));
+				return true;  // Should pause
+			}
+		}
+	}
+
+	LeaveCriticalSection(const_cast<CRITICAL_SECTION*>(&m_csPausedPlayers));
+
+	// Vox Deorum: AI turn cooldown — 5s delay between sequential AI turns in production mode
+	if (m_bAICooldownActive)
+	{
+		DWORD elapsed = GetTickCount() - m_dwLastAITurnDeactivatedTime;
+		if (elapsed >= AI_TURN_COOLDOWN_MS)
+		{
+			m_bAICooldownActive = false;
+		}
+		else
+		{
+			// Only block if there's an active non-human player
+			for (int i = 0; i < MAX_MAJOR_CIVS; i++)
+			{
+				CvPlayer& player = GET_PLAYER((PlayerTypes)i);
+				if (player.isAlive() && player.isTurnActive() && !player.isHuman())
+					return true;  // Active AI during cooldown - pause
+			}
+			// No active AI (e.g., last AI finished, human turn next) - cancel cooldown
+			m_bAICooldownActive = false;
+		}
+	}
+
+	return false;  // No need to pause
+}
+
+// Vox Deorum: Called when a non-human player's turn is deactivated
+void CvConnectionService::OnAITurnDeactivated()
+{
+	if (!m_bProductionMode) return;  // Only in production mode
+
+	m_dwLastAITurnDeactivatedTime = GetTickCount();
+	m_bAICooldownActive = true;
+	Log(LOG_DEBUG, "OnAITurnDeactivated - AI turn cooldown started (5s)");
+}
+
+// Vox Deorum: Set production mode (called via IPC from bridge service)
+void CvConnectionService::SetProductionMode(bool bEnabled)
+{
+	m_bProductionMode = bEnabled;
+	if (!bEnabled)
+		m_bAICooldownActive = false;  // Cancel active cooldown when leaving production mode
+
+	Log(LOG_INFO, bEnabled ? "SetProductionMode - Production mode enabled" : "SetProductionMode - Production mode disabled");
+}

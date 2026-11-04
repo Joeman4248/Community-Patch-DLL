@@ -1,0 +1,365 @@
+/*	-------------------------------------------------------------------------------------------------------
+	© 2024 Vox Deorum Development Team. Connection Service for Bridge Communication.
+	------------------------------------------------------------------------------------------------------- */
+#pragma once
+
+#ifndef CIV5_CONNECTION_SERVICE_H
+#define CIV5_CONNECTION_SERVICE_H
+
+#include <windows.h>
+#include <string>
+#include <queue>
+#include <vector>
+#include <map>
+#include <set>
+#include "../ThirdPartyLibs/ArduinoJson.hpp"
+
+// Use ArduinoJson
+using namespace ArduinoJson;
+
+// Forward declarations
+class FILogFile;
+struct lua_State;
+
+// Connection Service for communicating with external Bridge Service
+class CvConnectionService
+{
+public:
+	// Singleton pattern
+	static CvConnectionService& GetInstance();
+
+	// Initialize the connection service
+	bool Setup();
+
+	// Shutdown the connection service and cleanup resources
+	void Shutdown();
+
+	// Log messages at different levels
+	enum LogLevel
+	{
+		LOG_DEBUG = 0,
+		LOG_INFO = 1,
+		LOG_WARNING = 2,
+		LOG_ERROR = 3
+	};
+
+	// Log a message to the connection log file
+	void Log(LogLevel level, const char* message);
+
+	// Process queued messages from the main game thread
+	void ProcessMessages();
+
+	// Vox Deorum: Drain from a UI Lua context (Game.ProcessConnectionMessages).
+	// The engine stops ticking CvGame::update while the leaderhead scene is up, so the
+	// game-core pump points below cannot service the queue for as long as a player sits in
+	// a diplomacy conversation. A UI context that stays alive there pumps on our behalf.
+	//
+	// This is NOT the same drain as ProcessMessages: it runs off the game core's execution
+	// boundary, so it routes only the message types marked UI-safe by IsUiSafeMessageType
+	// and hands everything else back to the queue for the next game-core pump.
+	void ProcessMessagesFromUI();
+	
+	// Send a message to the Bridge Service (called from game code)
+	// Returns the length of the outgoing queue after adding the message
+	int SendMessage(const DynamicJsonDocument& message);
+
+	// Register a Lua function for external calling
+	void RegisterLuaFunction(const char* name, lua_State* L, int stackIndex);
+	
+	// Unregister a specific function
+	void UnregisterLuaFunction(const char* name);
+
+	// Forward game events to the Bridge Service
+	void ForwardGameEvent(const char* eventName, class ICvEngineScriptSystemArgs1* args);
+	
+	// Save state (can be called when game is being saved)
+	void SerializeEventSequence();
+
+	// Vox Deorum: read the persisted game UUID from the Deorum save-data
+	// table for recording capture identity. Returns false when the table or
+	// the ID is absent, which leaves capture unarmed until the next retry.
+	bool TryReadGameUuid(std::string& uuidText);
+	
+	// Broadcast a custom event with JSON payload
+	void BroadcastEvent(const char* eventName, const DynamicJsonDocument& payload);
+	int BroadcastEventFromLua(lua_State* L);
+
+	// External function registry management
+	void RegisterExternalFunction(const char* name, bool bAsync);
+	void UnregisterExternalFunction(const char* name);
+	bool IsExternalFunctionRegistered(const char* name) const;
+	
+	// External function call result structure
+	struct ExternalCallResult
+	{
+		bool bSuccess;           // Whether the call succeeded
+		std::string strError;    // Error message if failed
+		std::string strData;     // JSON response data as string
+	};
+	
+	// Callback type for external function calls
+	typedef void (*ExternalCallCallback)(const ExternalCallResult& result, void* userData);
+	
+	// Call an external function (function name and callback extracted from Lua state)
+	// Returns the number of values pushed onto the Lua stack
+	int CallExternalFunction(lua_State* L);
+	
+	// Convert JSON to Lua value (made public for use in Lua callbacks)
+	void ConvertJsonToLuaValue(lua_State* L, const JsonVariant& value);
+
+	// Manage paused players
+	void AddPausedPlayer(int iPlayerID);
+	void RemovePausedPlayer(int iPlayerID);
+	void ClearPausedPlayers();
+
+	// Check if the core thread should be paused
+	bool ShouldPauseGameCore();
+
+	// Vox Deorum: AI turn cooldown — delays next AI turn in production mode
+	void OnAITurnDeactivated();
+	void SetProductionMode(bool bEnabled);
+	static const DWORD AI_TURN_COOLDOWN_MS = 5000;
+	
+private:
+	// Private constructor for singleton
+	CvConnectionService();
+	~CvConnectionService();
+
+	// Prevent copying
+	CvConnectionService(const CvConnectionService&);
+	CvConnectionService& operator=(const CvConnectionService&);
+
+	// Get the log file for writing (main thread)
+	FILogFile* GetLogFile();
+
+	// Vox Deorum: Separate log file for the pipe thread to avoid FILogFile lock contention
+	FILogFile* GetPipeLogFile();
+
+	// Vox Deorum: Safe logging with SEH to avoid C2712 error
+	static void SafeLogMessage(FILogFile* pLog, const char* message);
+
+	// Named Pipe server thread function
+	static DWORD WINAPI NamedPipeServerThread(LPVOID lpParam);
+	
+	// Handle a single client connection
+	void HandleClientConnection(HANDLE hPipe);
+
+	// Queue management methods
+	// Returns the length of the outgoing queue after adding the message
+	int QueueOutgoingMessage(const std::string& messageJson);
+	bool DequeueOutgoingMessage(std::string& messageJson);
+	
+	// Message routing and handling. Returns false when bUiPolicy declined the message
+	// rather than handling it, meaning the caller must hand it back to the queue.
+	bool RouteMessage(const std::string& messageJson, bool bUiPolicy);
+
+	// Vox Deorum: Which pump asked for a drain. The caller settles two separate questions:
+	// whether this drain may nest inside another, and which message types it may route.
+	enum DrainCaller
+	{
+		DRAIN_GAME_CORE,  // CvGame/CvPlayer/AI pump points. Never nests; routes everything.
+		DRAIN_UI,         // Game.ProcessConnectionMessages. Never nests; UI-safe types only.
+		DRAIN_AWAIT,      // CallExternalFunction's wait loop. Nests, inheriting the outer policy.
+	};
+
+	// Vox Deorum: Shared drain body behind all three pumps.
+	void DrainIncomingMessages(DrainCaller eCaller);
+
+	// Vox Deorum: Whether a message type must be held for a game-core pump point rather
+	// than routed off the game core's execution boundary. Everything not named here is
+	// routable from the UI thread, so a message type added later needs review against
+	// this list — see its definition for what makes a type unsafe.
+	static bool IsGameCoreOnlyMessageType(const std::string& messageType);
+
+	// Vox Deorum: Scope-bound ownership of the drain section and its depth counter, so
+	// every exit from DrainIncomingMessages — an early return, or a throw escaping the
+	// routing loop — releases both. Leaking either would wedge every pump in the process.
+	// Deliberately holds references rather than the owning service, so it needs no access
+	// to private members (a nested class has none of its own under this C++03 toolset).
+	class DrainScope
+	{
+	public:
+		DrainScope(CRITICAL_SECTION& kSection, int& iDepth);
+		~DrainScope();
+
+		// False when another thread already holds the section. Never blocks.
+		bool TryAcquire();
+
+		// Count this drain against the nesting cap for as long as the scope lives.
+		void PushDepth();
+
+	private:
+		CRITICAL_SECTION& m_kSection;
+		int& m_iDepth;
+		bool m_bHeld;
+		bool m_bCounted;
+
+		DrainScope(const DrainScope&);
+		DrainScope& operator=(const DrainScope&);
+	};
+	
+	// Lua execution handlers
+	void HandleLuaExecute(const char* script, const char* id);
+	void HandleLuaCall(const char* functionName, const JsonArray& args, const char* id);
+
+	// Vox Deorum: iStackBase is lua_gettop as it stood before the call whose result this
+	// reports. Results are everything above it. Never re-derive that from lua_gettop
+	// alone: inside a C function lua_gettop is relative to that function's own frame, so
+	// a drain nested in Game.CallExternal would otherwise serialize and pop the waiting
+	// call's arguments as if they were results.
+	void ProcessLuaResult(lua_State* L, int executionResult, const char* id, int iStackBase);
+	void ConvertLuaToJsonValue(lua_State* L, int index, JsonVariant parent, const char* key);
+	
+	// Shared function to convert Lua values to fill a key in a JsonDocument
+	void ConvertLuaValuesInDocument(lua_State* L, int firstIndex, int numValues, DynamicJsonDocument& parent, const char* key);
+	
+	// Structure to store registered Lua functions. The function itself lives in the
+	// "VoxDeorum.Functions" registry table under its name (see CvConnectionService.cpp).
+	struct LuaFunctionInfo {
+		lua_State* pLuaState;      // The Lua state that registered this function
+		std::string strDescription; // Optional description for documentation
+	};
+	
+	// Structure to store external function information
+	struct ExternalFunctionInfo {
+		std::string strName;       // Function name
+		bool bAsync;               // Whether the function is async
+		bool bRegistered;          // Registration status
+	};
+	
+	// Structure to store pending async external calls
+	struct PendingExternalCall {
+		std::string strCallId;              // Unique ID for this call
+		std::string strFunctionName;        // Function being called
+		ExternalCallCallback pCallback;     // Callback function
+		void* pUserData;                    // User data for callback
+		DWORD dwTimestamp;                   // When the call was made
+	};
+	
+	// Internal state
+	bool m_bInitialized;
+	lua_State* m_pLuaState;
+	ICvEngineScriptSystem1* m_pkScriptSystem;  // Cached script system instance
+
+	// Named Pipe server state
+	HANDLE m_hPipe;
+	HANDLE m_hThread;
+	DWORD m_dwThreadId;
+	volatile bool m_bClientConnected;
+	volatile bool m_bShutdownRequested;
+
+	// Vox Deorum: List of paused players
+	std::set<int> m_pausedPlayers;
+	
+	// Thread-safe message queues (store serialized JSON strings)
+	std::queue<std::string> m_incomingQueue;  // Bridge -> Game (stores stripped JSON)
+	std::queue<std::string> m_outgoingQueue;  // Game -> Bridge (stores wrapped JSON)
+	
+	// Critical sections for thread safety
+	CRITICAL_SECTION m_csIncoming;
+	CRITICAL_SECTION m_csOutgoing;
+	CRITICAL_SECTION m_csFunctions;
+	CRITICAL_SECTION m_csExternalFunctions;
+	CRITICAL_SECTION m_csPausedPlayers;  // Vox Deorum: For thread-safe access to paused players list
+	
+	// Map of function name to function info
+	std::map<std::string, LuaFunctionInfo> m_registeredFunctions;
+	
+	// Map of external function name to function info
+	std::map<std::string, ExternalFunctionInfo> m_externalFunctions;
+	
+	// Map of pending external calls (call ID to pending call info)
+	std::map<std::string, PendingExternalCall> m_pendingExternalCalls;
+	CRITICAL_SECTION m_csPendingCalls;
+	
+	// Map to store results for synchronous calls (call ID to result)
+	std::map<std::string, ExternalCallResult> m_syncCallResults;
+	
+	// Counter for generating unique call IDs
+	unsigned int m_uiNextCallId;
+
+	// Vox Deorum: Held for the duration of a drain. The drain was single-threaded until
+	// ProcessMessagesFromUI gave the UI thread a way in, and m_pMainThreadReadBuffer /
+	// m_pMainThreadWriteBuffer are unsynchronized scratch documents shared by every
+	// handler. Contended with TryEnterCriticalSection, never a blocking wait: whichever
+	// thread loses simply skips that pump rather than stalling a render frame or a turn
+	// on the other. Recursive by nature, so same-thread nesting is still decided by
+	// m_iProcessingDepth below.
+	//
+	// Unlike the sections above, this one lives across Setup/Shutdown cycles — it is
+	// created in the constructor and destroyed in the destructor. Shutdown frees the very
+	// buffers a drain is using, so it has to be able to take this section to fence against
+	// an in-flight drain; a section that Shutdown itself destroys could not do that.
+	CRITICAL_SECTION m_csProcessing;
+
+	// Vox Deorum: Routing policy of the outermost drain currently on the stack, so a
+	// nested DRAIN_AWAIT inherits it instead of quietly widening what may run. Only
+	// meaningful while m_iProcessingDepth is above zero, and written under m_csProcessing.
+	bool m_bUiDrainPolicy;
+
+	// Vox Deorum: Number of drains currently on the stack, always read and written under
+	// m_csProcessing. ForwardGameEvent can call ProcessMessages from inside Lua event
+	// hooks that fire during game-core mutation, and an ordinary pump refuses to nest
+	// there: it buys nothing, because the outer drain reaches the same queue as soon as
+	// the hook returns.
+	//
+	// The synchronous CallExternalFunction wait loop is the one exception. It pumps
+	// precisely because its caller cannot make progress until the matching
+	// external_response is routed, so refusing it does not defer work — it deadlocks
+	// the call until it times out. That happens whenever a Lua function invoked by a
+	// lua_call makes a synchronous Game.CallExternal, which is exactly the shape the
+	// diplomacy push handlers are one line away from. Nesting is safe there because
+	// RouteMessage copies every string out of m_pMainThreadReadBuffer before it can
+	// re-enter, and every writer of m_pMainThreadWriteBuffer fills and sends it in one
+	// uninterrupted stretch. Main-thread only — no atomics needed.
+	int m_iProcessingDepth;
+
+	// Vox Deorum: Cap on nested drains. Each level parks another Lua handler on the
+	// stack waiting for the bridge, so beyond a handful the game is misusing
+	// synchronous external calls and one CALL_TIMEOUT beats unbounded recursion.
+	static const int MAX_DRAIN_DEPTH = 4;
+
+	// Vox Deorum: AI turn cooldown state
+	DWORD m_dwLastAITurnDeactivatedTime;  // GetTickCount() timestamp of last AI deactivation
+	bool m_bAICooldownActive;             // Whether cooldown timer is running
+	bool m_bProductionMode;               // Whether vox-agents is in a visual production mode
+
+	// Event tracking for proper event IDs
+	unsigned int m_uiCurrentTurn;
+	unsigned int m_uiEventSequence;
+	
+	// Helper to generate unique call ID
+	std::string GenerateCallId();
+	
+	// Helper to generate event ID based on turn and sequence
+	unsigned long long GenerateEventId();
+	
+	// Helper to clean Lua error messages
+	std::string CleanLuaErrorMessage(const char* errorMsg);
+
+	// Serialization methods for event sequence
+	void DeserializeEventSequence();
+
+	// Track last Lua GC time (for periodic garbage collection)
+	DWORD m_dwLastGCTime;
+	
+	// Dynamic memory buffers for main thread message processing
+	// Separate buffers to prevent memory corruption during nested operations
+	// Allocated during Setup() to avoid unnecessary memory usage when IPC is disabled
+	DynamicJsonDocument* m_pMainThreadReadBuffer;   // For deserializing incoming messages
+	DynamicJsonDocument* m_pMainThreadWriteBuffer;  // For serializing outgoing messages
+	
+	// Helper to handle external call response
+	void HandleExternalCallResponse(const char* callId, bool bSuccess, const char* error, const char* data);
+	
+	// Helper functions for external call validation
+	bool ValidateExternalCall(const char* functionName, ExternalCallResult& result);
+	
+	// Shared post-processing function for external call results
+	void ProcessExternalCallResult(lua_State* L, const ExternalCallResult& result);
+
+	// Static callback handler for external function calls
+	static void HandleExternalCallCallback(const ExternalCallResult& result, void* userData);
+};
+
+#endif // CIV5_CONNECTION_SERVICE_H

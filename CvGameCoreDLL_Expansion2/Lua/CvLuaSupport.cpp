@@ -22,6 +22,7 @@
 #include "CvLuaMap.h"
 #include "CvLuaGame.h"
 #include "CvLuaPlayer.h"
+#include "../CvConnectionService.h"
 #include "CvLuaTeam.h"
 #include "CvLuaCity.h"
 #include "CvLuaPlot.h"
@@ -374,6 +375,11 @@ void LuaSupport::DumpCallStack(lua_State* L, FILogFile* pLog)
 //------------------------------------------------------------------------------
 bool LuaSupport::CallHook(ICvEngineScriptSystem1* pkScriptSystem, const char* szName, ICvEngineScriptSystemArgs1* args, bool& value)
 {
+	// Vox Deorum: forward every game event to the bridge (non-blocking), before the Lua hook
+	if (MOD_IPC_CHANNEL) {
+		CvConnectionService::GetInstance().ForwardGameEvent(szName, args);
+	}
+
 	if (MOD_API_DISABLE_LUA_HOOKS)
 		return false;
 

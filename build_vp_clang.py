@@ -123,6 +123,8 @@ CPP = [
     'CvGameCoreDLL_Expansion2\\CvCityConnections.cpp',
     'CvGameCoreDLL_Expansion2\\CvCityManager.cpp',
     'CvGameCoreDLL_Expansion2\\CvCitySpecializationAI.cpp',
+    'CvGameCoreDLL_Expansion2\\CvConnectionService.cpp',
+    'CvGameCoreDLL_Expansion2\\CvConnectionSchema.cpp',
     'CvGameCoreDLL_Expansion2\\CvCityStrategyAI.cpp',
     'CvGameCoreDLL_Expansion2\\CvContractClasses.cpp',
     'CvGameCoreDLL_Expansion2\\CvCorporationClasses.cpp',

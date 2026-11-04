@@ -72,6 +72,7 @@ extern "C" __declspec(dllimport) long __stdcall CoCreateGuid(GUID* pguid);
 
 #include "CvSpanSerialization.h"
 #include "CvEnumMapSerialization.h"
+#include "CvConnectionService.h"
 
 //updated by pre-build hook
 #include "../commit_id.inc"
@@ -1092,6 +1093,11 @@ void CvGame::DoGameStarted()
 	GET_PLAYER(getActivePlayer()).GetUnitCycler().Rebuild();
 
 	CvPlayerManager::Refresh(false);
+
+	// Vox Deorum: start the connection service (named pipe) for the bridge
+	if (MOD_IPC_CHANNEL) {
+		CvConnectionService::GetInstance().Setup();
+	}
 }
 
 
@@ -1099,6 +1105,10 @@ void CvGame::DoGameStarted()
 //	--------------------------------------------------------------------------------
 void CvGame::uninit()
 {
+	if (MOD_IPC_CHANNEL) {
+		CvConnectionService::GetInstance().Shutdown();
+	}
+
 	CvGoodyHuts::Uninit();
 	CvBarbarians::Uninit();
 
@@ -1619,6 +1629,10 @@ bool ExternalPause()
 //	---------------------------------------------------------------------------
 void CvGame::update()
 {
+	if (MOD_IPC_CHANNEL) {
+		CvConnectionService::GetInstance().ProcessMessages();
+	}
+
 	if(IsWaitingForBlockingInput())
 	{
 		if(!GC.GetEngineUserInterface()->isDiploActive())
@@ -8455,6 +8469,10 @@ void CvGame::doTurn()
 		if(GET_TEAM((TeamTypes)iI).isAlive())
 		{
 			GET_TEAM((TeamTypes)iI).doTurn();
+
+			if (MOD_IPC_CHANNEL) {
+				CvConnectionService::GetInstance().ProcessMessages();
+			}
 		}
 	}
 
@@ -8468,6 +8486,10 @@ void CvGame::doTurn()
 	GetGameCulture()->DoTurn();
 	GetGameCorporations()->DoTurn();
 	GetGameContracts()->DoTurn();
+
+	if (MOD_IPC_CHANNEL) {
+		CvConnectionService::GetInstance().ProcessMessages();
+	}
 
 	for (int iLoop = 0; iLoop < GC.getNumResourceInfos(); iLoop++)
 	{
@@ -11094,6 +11116,11 @@ void CvGame::Write(FDataStream& kStream) const
 
 	CvStreamSaveVisitor serialVisitor(kStream);
 	Serialize(*this, serialVisitor);
+
+	// Vox Deorum: store the connection service's event sequence in the SaveGameDB
+	if (MOD_IPC_CHANNEL) {
+		CvConnectionService::GetInstance().SerializeEventSequence();
+	}
 
 	// Save game database comes last
 	writeSaveGameDB(kStream);
