@@ -7,6 +7,11 @@ This is Joeman4248's fork of the Vox Populi DLL. Branch `vox-ipc-5.4.8` is **VP 
 channel that lets a program on the same PC receive the game's events and call Lua functions that mods register,
 for example to connect an AI assistant or other tools to a running game.
 
+I (Joeman4248) used Claude (Anthropic's AI assistant) to combine the two, Vox Populi 5.4.8 and Vox Deorum's
+connection service, into this custom DLL. **Anyone is free to use it.** It's under the same license as Vox
+Populi (below), so you can use, change and share it, but never sell it. If you build on it, please credit the
+people whose work it's built on: John Chen and the Vox Deorum project, and the Community Patch / Vox Populi team.
+
 - **Off by default.** Nothing changes unless the mod option `IPC_CHANNEL` is set to 1. Gameplay and AI are stock VP
   5.4.8 either way.
 - **Credit:** the connection service was written by **John Chen ([CIVITAS-John](https://github.com/CIVITAS-John))
