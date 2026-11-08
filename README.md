@@ -17,6 +17,26 @@ for example to connect an AI assistant or other tools to a running game.
   in game.
 - **License:** GPL v3 plus the Community Patch EULA, like upstream.
 
+### What changed from VP 5.4.8
+
+See every line: [compare `Release-5.4.8` → `vox-ipc-5.4.8`](https://github.com/Joeman4248/Community-Patch-DLL/compare/Release-5.4.8...vox-ipc-5.4.8).
+
+| File(s) | Change | Written by |
+|---|---|---|
+| `CvConnectionService.cpp/.h`, `CvConnectionSchema.cpp/.h` (new) | Named-pipe server, JSON messages, `lua_call`, event forwarding | John Chen / Vox Deorum (ported) |
+| `Lua/CvLuaSupport.cpp` | Every `GameEvents` hook is also sent to the pipe | John Chen / Vox Deorum (ported) |
+| `Lua/CvLuaGame.cpp/.h` | New `Game.RegisterFunction`, `CallExternal`, `BroadcastEvent` and related functions | John Chen / Vox Deorum (ported) |
+| `CvDealClasses.cpp` | `DealMade` event sent to the pipe | John Chen / Vox Deorum (ported) |
+| `CvGame.cpp` | Starts and stops the service; handles messages during the game update; event counter in saves | John Chen / Vox Deorum (ported) |
+| `CustomMods.*`, `NewCustomModOptions.xml` | `IPC_CHANNEL` option (default 0) that switches all of it on | Joeman4248 |
+| `ThirdPartyLibs/ArduinoJson.hpp`, `ThirdPartyLibs/msinttypes/` (new) | JSON library and `stdint.h` for the old MSVC toolset | Benoît Blanchon (MIT); Alexander Chemeris (BSD) |
+| `VoxPopuli.vcxproj*`, `build_vp_clang*.py` | New sources added to the builds | Joeman4248 |
+| `.github/workflows/build_vp.yml` | Download SDKs with `curl.exe` (the `wget.exe` download was corrupt) | Joeman4248 |
+| `README.md`, `VOX-IPC.md` | This documentation | Joeman4248 |
+
+**Not ported from Vox Deorum, on purpose:** its reinforcement-learning capture, tactical AI and flavor changes,
+player pausing, and `SetVoxDeorumMode` (which hides VP's error dialogs).
+
 **Full details:** [VOX-IPC.md](VOX-IPC.md) covers credits, licenses, what changed, what was left out, building,
 installing and updating.
 
