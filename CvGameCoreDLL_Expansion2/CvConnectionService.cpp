@@ -579,6 +579,9 @@ FILogFile* CvConnectionService::GetPipeLogFile()
 }
 
 // Named Pipe server thread function
+// Vox IPC: This thread owns the pipe handle. It is the only code that disconnects or closes it;
+// m_hPipe is kept for information only. Every wait loop checks m_bShutdownRequested at least
+// every ~50 ms so Shutdown() can join the thread without TerminateThread.
 DWORD WINAPI CvConnectionService::NamedPipeServerThread(LPVOID lpParam)
 {
 	CvConnectionService* pService = static_cast<CvConnectionService*>(lpParam);
@@ -589,7 +592,7 @@ DWORD WINAPI CvConnectionService::NamedPipeServerThread(LPVOID lpParam)
 	const char* basePipeName = envPipeName ? envPipeName : "vox-deorum-bridge";
 	sprintf_s(pipeNameBuffer, sizeof(pipeNameBuffer), "\\\\.\\pipe\\tmp-app.%s", basePipeName);
 	const char* pipeName = pipeNameBuffer;
-	
+
 	while (!pService->m_bShutdownRequested)
 	{
 		// Create the Named Pipe
@@ -604,7 +607,7 @@ DWORD WINAPI CvConnectionService::NamedPipeServerThread(LPVOID lpParam)
 			262144,                      // input buffer size
 			0,                         // client time-out
 			NULL);                     // default security attributes
-		
+
 		if (hPipe == INVALID_HANDLE_VALUE)
 		{
 			std::stringstream ss;
@@ -613,21 +616,23 @@ DWORD WINAPI CvConnectionService::NamedPipeServerThread(LPVOID lpParam)
 			Sleep(50); // Wait before retrying
 			continue;
 		}
-		
-		pService->m_hPipe = hPipe;
+
+		pService->m_hPipe = hPipe; // Vox IPC: information only, never closed by other threads
 		pService->Log(LOG_INFO, "NamedPipeServerThread - Named Pipe created, waiting for client connection");
-		
+
 		// Wait for client to connect (non-blocking mode)
-		BOOL waitingForClient = true;
-		while (waitingForClient && !pService->m_bShutdownRequested)
+		// Vox IPC: local flags instead of using m_hPipe == INVALID_HANDLE_VALUE as an error flag
+		bool bConnected = false;
+		bool bPipeError = false;
+		while (!bConnected && !bPipeError && !pService->m_bShutdownRequested)
 		{
 			BOOL connected = ConnectNamedPipe(hPipe, NULL);
 			DWORD error = GetLastError();
-			
+
 			if (connected || error == ERROR_PIPE_CONNECTED)
 			{
 				// Client successfully connected
-				waitingForClient = false;
+				bConnected = true;
 			}
 			else if (error == ERROR_PIPE_LISTENING)
 			{
@@ -636,7 +641,9 @@ DWORD WINAPI CvConnectionService::NamedPipeServerThread(LPVOID lpParam)
 			}
 			else if (error == ERROR_NO_DATA)
 			{
-				// Pipe is in non-blocking mode and no client is ready
+				// Vox IPC: a client connected and closed again before we saw it. Disconnect
+				// so the instance goes back to listening (otherwise this repeats forever).
+				DisconnectNamedPipe(hPipe);
 				Sleep(50); // Wait 50ms before checking again
 			}
 			else
@@ -645,32 +652,29 @@ DWORD WINAPI CvConnectionService::NamedPipeServerThread(LPVOID lpParam)
 				std::stringstream ss;
 				ss << "NamedPipeServerThread - Failed to connect to client, error: " << error;
 				pService->Log(LOG_ERROR, ss.str().c_str());
-				CloseHandle(hPipe);
-				pService->m_hPipe = INVALID_HANDLE_VALUE;
-				waitingForClient = false;
-				
-				break; // Exit the inner loop to create a new pipe
+				bPipeError = true; // Exit the inner loop to create a new pipe
 			}
 		}
-		
+
 		// Check if we should continue (client connected) or retry (error or shutdown)
-		if (pService->m_bShutdownRequested || pService->m_hPipe == INVALID_HANDLE_VALUE)
+		if (!bConnected)
 		{
-			if (pService->m_hPipe != INVALID_HANDLE_VALUE)
+			pService->m_hPipe = INVALID_HANDLE_VALUE;
+			CloseHandle(hPipe);
+			if (bPipeError && !pService->m_bShutdownRequested)
 			{
-				CloseHandle(hPipe);
-				pService->m_hPipe = INVALID_HANDLE_VALUE;
+				Sleep(50); // Vox IPC: don't spin on a persistent error
 			}
 			continue;
 		}
-		
+
 		// Client connected
 		pService->m_bClientConnected = true;
 		pService->Log(LOG_INFO, "NamedPipeServerThread - Bridge Service connected");
-		
+
 		// Handle the client connection
 		pService->HandleClientConnection(hPipe);
-		
+
 		// Client disconnected
 		pService->m_bClientConnected = false;
 		pService->Log(LOG_INFO, "NamedPipeServerThread - Bridge Service disconnected");
@@ -681,141 +685,188 @@ DWORD WINAPI CvConnectionService::NamedPipeServerThread(LPVOID lpParam)
 		LeaveCriticalSection(&pService->m_csPausedPlayers);
 		pService->m_bAICooldownActive = false;
 		pService->m_bProductionMode = false;
-		
+
 		// Cleanup
-		if (pService->m_hPipe != INVALID_HANDLE_VALUE) {
-			DisconnectNamedPipe(hPipe);
-			CloseHandle(hPipe);
-			pService->m_hPipe = INVALID_HANDLE_VALUE;
-		}
-		
+		// Vox IPC: always done here (this thread owns the handle); clear m_hPipe first so
+		// nobody reads a handle number that may be reused after CloseHandle.
+		pService->m_hPipe = INVALID_HANDLE_VALUE;
+		DisconnectNamedPipe(hPipe);
+		CloseHandle(hPipe);
+
 		// Small delay before accepting new connection
 		if (!pService->m_bShutdownRequested)
 		{
 			Sleep(50);
 		}
 	}
-	
+
 	pService->Log(LOG_INFO, "NamedPipeServerThread - Thread exiting");
 	return 0;
 }
 
+// Vox IPC: Tell a newly connected client about every Lua function registered so far, so a
+// bridge that connects after registration still learns them. Called from the pipe thread;
+// only queues (no SendMessage: that checks m_bInitialized and logs on the main log).
+void CvConnectionService::AnnounceRegisteredFunctions()
+{
+	std::vector<std::string> names;
+	EnterCriticalSection(&m_csFunctions);
+	for (std::map<std::string, LuaFunctionInfo>::const_iterator it = m_registeredFunctions.begin();
+		it != m_registeredFunctions.end(); ++it)
+	{
+		names.push_back(it->first);
+	}
+	LeaveCriticalSection(&m_csFunctions);
+
+	for (size_t i = 0; i < names.size(); i++)
+	{
+		DynamicJsonDocument doc(512);
+		doc["type"] = "lua_register";
+		doc["function"] = names[i].c_str(); // names outlives doc, so no copy is needed
+		doc["description"] = "Registered from Lua";
+		std::string messageStr;
+		serializeJson(doc, messageStr);
+		QueueOutgoingMessage(messageStr);
+	}
+
+	if (!names.empty())
+	{
+		std::stringstream ss;
+		ss << "HandleClientConnection - Announced " << names.size() << " registered Lua functions";
+		Log(LOG_INFO, ss.str().c_str());
+	}
+}
+
 // Handle a single client connection
+// Vox IPC: Each iteration: (1) write queued messages until the pipe is full, (2) read what the
+// client sent (bounded per iteration), (3) queue every complete incoming message, (4) sleep
+// 20 ms if nothing was read or written. Returns on disconnect, pipe error or shutdown.
 void CvConnectionService::HandleClientConnection(HANDLE hPipe)
 {
 	// Define chunk size for message splitting (32KB chunks)
 	const size_t OUTGOING_CHUNK_SIZE = 32768;
+	// Vox IPC: bounds per iteration so reading and writing take turns and shutdown is seen
+	const size_t MAX_WRITE_PER_ITERATION = 1048576;
+	const size_t MAX_READ_PER_ITERATION = 1048576;
+	const size_t READ_BUFFER_SIZE = 262144;
+	const size_t MAX_INCOMPLETE_BUFFER = 10485760; // 10MB limit for incomplete messages
+	const std::string delimiter = "!@#$%^!";
 
 	// Dynamic message buffer to avoid repeated allocations
 	std::string messageBuffer;
 	messageBuffer.reserve(262144); // Reserve initial capacity
+	// Vox IPC: no delimiter starts before this offset in messageBuffer (avoids rescanning)
+	size_t scanFrom = 0;
 
-	// Temporary read buffer for pipe operations
-	char readBuffer[262144];
-	DWORD bytesRead, bytesWritten;
-	
+	// Vox IPC: read buffer on the heap, allocated once per connection (not 256 KB of stack)
+	std::vector<char> readBuffer(READ_BUFFER_SIZE);
+
+	// Vox IPC: the outgoing message being sent and how much of it is written. Survives across
+	// iterations so a full pipe never drops or splits a message: we retry from the same offset.
+	std::string pendingMessage;
+	size_t pendingOffset = 0;
+	bool bHasPending = false;
+
+	AnnounceRegisteredFunctions();
+
 	while (m_bClientConnected && !m_bShutdownRequested)
 	{
-		// Send ALL queued outgoing messages
-		bool hasOutgoingMessages = true;
-		while (hasOutgoingMessages && m_bClientConnected && !m_bShutdownRequested)
+		bool bDidWork = false;
+
+		// Send queued outgoing messages until the queue is empty or the pipe is full
+		bool bPipeFull = false;
+		size_t bytesWrittenThisIteration = 0;
+		while (!bPipeFull && bytesWrittenThisIteration < MAX_WRITE_PER_ITERATION && !m_bShutdownRequested)
 		{
-			std::string outgoingMessage;
-			if (DequeueOutgoingMessage(outgoingMessage))
+			if (!bHasPending)
 			{
-				// Add delimiter to the message
-				outgoingMessage += "!@#$%^!";
-
-				// Send the message in chunks if it's too large
-				size_t messageLength = outgoingMessage.length();
-				size_t bytesSent = 0;
-				BOOL success = TRUE;
-
-				while (bytesSent < messageLength && success)
+				if (!DequeueOutgoingMessage(pendingMessage))
 				{
-					// Calculate chunk size (don't exceed CHUNK_SIZE)
-					size_t chunkSize = std::min(OUTGOING_CHUNK_SIZE, messageLength - bytesSent);
-
-					// Send the chunk
-					success = WriteFile(
-						hPipe,
-						outgoingMessage.c_str() + bytesSent,
-						(DWORD)chunkSize,
-						&bytesWritten,
-						NULL);
-
-					if (success)
-					{
-						bytesSent += bytesWritten;
-					}
+					break; // No more messages to send
 				}
+				// Add delimiter to the message
+				pendingMessage += delimiter;
+				pendingOffset = 0;
+				bHasPending = true;
+			}
 
-				if (!success)
+			// Send the next chunk (don't exceed CHUNK_SIZE)
+			size_t chunkSize = std::min(OUTGOING_CHUNK_SIZE, pendingMessage.length() - pendingOffset);
+			DWORD bytesWritten = 0;
+			BOOL success = WriteFile(
+				hPipe,
+				pendingMessage.data() + pendingOffset,
+				(DWORD)chunkSize,
+				&bytesWritten,
+				NULL);
+
+			if (!success)
+			{
+				DWORD error = GetLastError();
+				if (error == ERROR_PIPE_BUSY || error == ERROR_NO_DATA)
 				{
-					DWORD error = GetLastError();
-
-					// If pipe is busy, put the message back and break inner loop
-					if (error == ERROR_PIPE_BUSY || error == ERROR_NO_DATA)
-					{
-						// Re-queue the message at the front (this is a limitation of std::queue)
-						// For now, we'll just log and skip
-						std::stringstream ss;
-						ss << "HandleClientConnection - Pipe busy, will retry later. Error: " << error;
-						Log(LOG_WARNING, ss.str().c_str());
-						hasOutgoingMessages = false;
-					}
-					else
-					{
-						std::stringstream ss;
-						ss << "HandleClientConnection - Failed to send outgoing message, error: " << error;
-						Log(LOG_ERROR, ss.str().c_str());
-						break; // Break from inner loop on serious error
-					}
+					// Vox IPC: buffer full; keep the message and retry from the same offset next
+					// iteration. If the client actually closed, the read below sees ERROR_BROKEN_PIPE.
+					bPipeFull = true;
 				}
 				else
 				{
 					std::stringstream ss;
-					ss << "HandleClientConnection - Sent outgoing message: " << outgoingMessage;
-					Log(LOG_DEBUG, ss.str().c_str());
+					ss << "HandleClientConnection - Failed to send outgoing message, error: " << error;
+					Log(LOG_ERROR, ss.str().c_str());
+					return; // Vox IPC: real error ends the connection
 				}
+			}
+			else if (bytesWritten == 0)
+			{
+				// Vox IPC: PIPE_NOWAIT returns success with 0 bytes when the client isn't reading
+				bPipeFull = true;
 			}
 			else
 			{
-				// No more messages to send
-				hasOutgoingMessages = false;
+				pendingOffset += bytesWritten;
+				bytesWrittenThisIteration += bytesWritten;
+				bDidWork = true;
+
+				if (pendingOffset >= pendingMessage.length())
+				{
+					std::stringstream ss;
+					ss << "HandleClientConnection - Sent outgoing message: " << pendingMessage;
+					Log(LOG_DEBUG, ss.str().c_str());
+					pendingMessage.clear();
+					pendingOffset = 0;
+					bHasPending = false;
+				}
 			}
 		}
-		
-		// Flush the pipe after sending all messages to ensure the client receives the data
-		if (m_bClientConnected && !m_bShutdownRequested)
+		// Vox IPC: no FlushFileBuffers here; it blocks until the client has read everything,
+		// so a stalled client would wedge this thread.
+
+		// Read data from client (non-blocking), at most MAX_READ_PER_ITERATION bytes
+		bool bMoreToRead = true;
+		size_t bytesReadThisIteration = 0;
+		while (bMoreToRead && bytesReadThisIteration < MAX_READ_PER_ITERATION && m_bClientConnected && !m_bShutdownRequested)
 		{
-			FlushFileBuffers(hPipe);
-		}
-		
-		// Read and process messages from client (non-blocking)
-		bool hasIncomingData = true;
-		int messagesProcessed = 0;
-		const int maxMessagesPerIteration = 100; // Prevent processing too many messages at once
-		const std::string delimiter = "!@#$%^!";
-		
-		while (hasIncomingData && messagesProcessed < maxMessagesPerIteration && m_bClientConnected && !m_bShutdownRequested)
-		{
-			// Try to read data from pipe
+			DWORD bytesRead = 0;
 			BOOL success = ReadFile(
 				hPipe,
-				readBuffer,
-				sizeof(readBuffer) - 1,
+				&readBuffer[0],
+				(DWORD)readBuffer.size(),
 				&bytesRead,
 				NULL);
-			
+
 			if (!success)
 			{
 				DWORD error = GetLastError();
-				
-				// If no data available, we've read everything
-				if (error == ERROR_NO_DATA)
+
+				if (error == ERROR_MORE_DATA)
 				{
-					hasIncomingData = false;
+					// Vox IPC: message longer than the buffer; keep what we got and read on
+				}
+				// If no data available, we've read everything
+				else if (error == ERROR_NO_DATA)
+				{
+					bMoreToRead = false;
 				}
 				// Handle actual errors
 				else if (error == ERROR_BROKEN_PIPE || error == ERROR_PIPE_NOT_CONNECTED)
@@ -831,83 +882,84 @@ void CvConnectionService::HandleClientConnection(HANDLE hPipe)
 					return; // Break from main loop
 				}
 			}
-			else if (bytesRead == 0)
+
+			if (bytesRead == 0)
 			{
-				// No data read, we've read everything
-				hasIncomingData = false;
+				// No data read, we've read everything for now
+				bMoreToRead = false;
 			}
 			else
 			{
-				// Successfully read data
-				// Null-terminate the received data
-				readBuffer[bytesRead] = '\0';
-				
 				// Append to message buffer
-				messageBuffer.append(readBuffer, bytesRead);
-				
-				// Process complete messages from the buffer immediately
-				size_t pos = 0;
-				while ((pos = messageBuffer.find(delimiter)) != std::string::npos)
-				{
-					// Extract the message
-					std::string singleMessage = messageBuffer.substr(0, pos);
-					
-					// Only queue non-empty messages
-					if (!singleMessage.empty())
-					{
-						// Lock the incoming queue critical section
-						EnterCriticalSection(&m_csIncoming);
-						m_incomingQueue.push(singleMessage);
-						LeaveCriticalSection(&m_csIncoming);
-						
-						// Log the queuing action
-						std::stringstream ss;
-						ss << "HandleClientConnection - Queued message: " << singleMessage;
-						Log(LOG_DEBUG, ss.str().c_str());
-						
-						messagesProcessed++;
-					}
-					
-					// Remove the processed message and delimiter from buffer
-					messageBuffer.erase(0, pos + delimiter.length());
-					
-					// Break if we've processed enough messages
-					if (messagesProcessed >= maxMessagesPerIteration)
-					{
-						hasIncomingData = false; // Stop reading for this iteration
-						Log(LOG_WARNING, "HandleClientConnection - Reached max messages per iteration limit");
-						break;
-					}
-				}
-				
-				// Continue reading more data if we haven't hit the limit
+				messageBuffer.append(&readBuffer[0], bytesRead);
+				bytesReadThisIteration += bytesRead;
+				bDidWork = true;
 			}
 		}
-		
+
+		// Vox IPC: queue every complete message in the buffer, every iteration (no count cap)
+		size_t start = 0;
+		size_t pos = messageBuffer.find(delimiter, scanFrom);
+		while (pos != std::string::npos)
+		{
+			// Only queue non-empty messages
+			if (pos > start)
+			{
+				std::string singleMessage = messageBuffer.substr(start, pos - start);
+
+				// Lock the incoming queue critical section
+				EnterCriticalSection(&m_csIncoming);
+				m_incomingQueue.push(singleMessage);
+				LeaveCriticalSection(&m_csIncoming);
+
+				// Log the queuing action
+				std::stringstream ss;
+				ss << "HandleClientConnection - Queued message: " << singleMessage;
+				Log(LOG_DEBUG, ss.str().c_str());
+			}
+			start = pos + delimiter.length();
+			pos = messageBuffer.find(delimiter, start);
+		}
+		if (start > 0)
+		{
+			// Remove the processed messages and delimiters from buffer
+			messageBuffer.erase(0, start);
+		}
+		// A delimiter may start in the last (length - 1) bytes once more data arrives
+		scanFrom = (messageBuffer.size() >= delimiter.length()) ? messageBuffer.size() - (delimiter.length() - 1) : 0;
+
 		// Check if buffer is getting too large (prevent memory issues)
-		if (messageBuffer.size() > 10485760) // 10MB limit for incomplete messages
+		if (messageBuffer.size() > MAX_INCOMPLETE_BUFFER)
 		{
 			std::stringstream ss;
-			ss << "HandleClientConnection - Message buffer too large (" << messageBuffer.size() 
+			ss << "HandleClientConnection - Message buffer too large (" << messageBuffer.size()
 			   << " bytes), clearing to prevent memory issues";
 			Log(LOG_WARNING, ss.str().c_str());
 			messageBuffer.clear();
 			messageBuffer.reserve(262144); // Re-reserve standard capacity
+			scanFrom = 0;
 		}
-		
-		// Small delay only if we didn't process many messages / we need to handle incoming messages.
-		if (messagesProcessed < 3 && !hasIncomingData)
+
+		// Small delay to avoid busy waiting when idle (nothing read or written)
+		if (!bDidWork)
 		{
-			Sleep(20); // Small delay to avoid busy waiting when idle
+			Sleep(20);
 		}
 	}
-	
+
 	// Log any remaining data in buffer when disconnecting
 	if (!messageBuffer.empty())
 	{
 		std::stringstream ss;
-		ss << "HandleClientConnection - Connection closed with " << messageBuffer.size() 
+		ss << "HandleClientConnection - Connection closed with " << messageBuffer.size()
 		   << " bytes of incomplete data in buffer";
+		Log(LOG_WARNING, ss.str().c_str());
+	}
+	if (bHasPending)
+	{
+		std::stringstream ss;
+		ss << "HandleClientConnection - Connection closed with an outgoing message partly sent ("
+		   << pendingOffset << " of " << pendingMessage.length() << " bytes)";
 		Log(LOG_WARNING, ss.str().c_str());
 	}
 }
