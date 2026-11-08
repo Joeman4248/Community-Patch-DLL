@@ -1,5 +1,6 @@
 /*	-------------------------------------------------------------------------------------------------------
 	© 2024 Vox Deorum Development Team. Connection Service for Bridge Communication.
+	Modified 2026-11 by Joeman4248: ported to Vox Populi 5.4.8. See VOX-IPC.md.
 	------------------------------------------------------------------------------------------------------- */
 #pragma once
 

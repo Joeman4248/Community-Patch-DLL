@@ -1,5 +1,8 @@
 /*	-------------------------------------------------------------------------------------------------------
 Opens an IPC channel that exposes the game's internal state to external services.
+Written by John Chen / the Vox Deorum Development Team (github.com/vox-deorum, DLL fork CIVITAS-John/vox-populi).
+Modified 2026-11 by Joeman4248: ported to Vox Populi 5.4.8 (RL capture, player pausing and SetVoxDeorumMode
+left out). Licensed with the rest of this repository (GPL v3 + Community Patch EULA). See VOX-IPC.md.
 	------------------------------------------------------------------------------------------------------- */
 
 #include "CvGameCoreDLLPCH.h"
