@@ -1664,6 +1664,28 @@ void CvConnectionService::ProcessLuaResult(lua_State* L, int executionResult, co
 			ConvertLuaValuesInDocument(L, iStackBase + 1, numResults, *m_pMainThreadWriteBuffer, "result");
 		}
 
+		// Vox IPC: A full write buffer drops elements silently, so a "success" would carry a
+		// truncated result. Report it as an error instead. Strings are stored by pointer, so
+		// an overflow means too many nodes, not long strings.
+		if (m_pMainThreadWriteBuffer->overflowed())
+		{
+			m_pMainThreadWriteBuffer->clear();
+			(*m_pMainThreadWriteBuffer)["type"] = "lua_response";
+			(*m_pMainThreadWriteBuffer)["id"] = id;
+			(*m_pMainThreadWriteBuffer)["success"] = false;
+			(*m_pMainThreadWriteBuffer)["error"]["code"] = "RESULT_TOO_LARGE";
+			(*m_pMainThreadWriteBuffer)["error"]["message"] = "Result has too many values or table entries for the response buffer; return less data";
+
+			std::stringstream warnMsg;
+			warnMsg << "ProcessLuaResult - Result too large for id: " << id << ", numResults: " << numResults;
+			Log(LOG_WARNING, warnMsg.str().c_str());
+		}
+
+		// Vox IPC: Send while the results are still on the stack. ArduinoJson keeps Lua
+		// strings (values and keys) by pointer, so popping first would let Lua collect them
+		// before SendMessage serializes the document.
+		SendMessage(*m_pMainThreadWriteBuffer);
+
 		// Restore the frame exactly as we found it, dropping only our own results
 		lua_settop(L, iStackBase);
 
@@ -1686,15 +1708,14 @@ void CvConnectionService::ProcessLuaResult(lua_State* L, int executionResult, co
 		logMsg << "ProcessLuaResult - Sent error response for id: " << id << ", error: " << cleanedError;
 		Log(LOG_DEBUG, logMsg.str().c_str());
 
+		// Send the response (the message was copied into a std::string above)
+		SendMessage(*m_pMainThreadWriteBuffer);
+
 		// Drop the error message, again leaving anything below the base untouched
 		lua_settop(L, iStackBase);
 	}
 
-	// Send the response
-	SendMessage(*m_pMainThreadWriteBuffer);
-
-	// Garbage collect
-	lua_gc(m_pLuaState, LUA_GCCOLLECT, 0);
+	// Vox IPC: No lua_gc(LUA_GCCOLLECT) here: a full collection of the whole shared Lua universe after every response caused stutter, from whichever thread drained.
 }
 
 // Shared function to convert Lua values to fill a key in a JsonDocument
@@ -1726,7 +1747,8 @@ void CvConnectionService::ConvertLuaValuesInDocument(lua_State* L, int firstInde
 // Convert a Lua value at the given stack index to a JsonVariant
 // parent: The parent JsonVariant (object or array) that will contain this value
 // key: The key/index to use when adding to parent ((char*)0 for direct assignment)
-void CvConnectionService::ConvertLuaToJsonValue(lua_State* L, int index, JsonVariant parent, const char* key)
+// iDepth: nesting level of this value (0 = top level); tables at the depth cap become "<too deep>"
+void CvConnectionService::ConvertLuaToJsonValue(lua_State* L, int index, JsonVariant parent, const char* key, int iDepth)
 {
 	// Make the index absolute if it's relative
 	if (index < 0 && index > LUA_REGISTRYINDEX)
@@ -1829,6 +1851,33 @@ void CvConnectionService::ConvertLuaToJsonValue(lua_State* L, int index, JsonVar
 		
 	case LUA_TTABLE:
 		{
+			// Vox IPC: Stop at depth 32 (or when the Lua stack can't grow) instead of recursing.
+			// A self-referencing or very deep table would otherwise overflow the Lua or C
+			// stack and crash the game; the cap also bounds cycles. Warn at most once a second.
+			if (iDepth >= 32 || !lua_checkstack(L, 4))
+			{
+				static DWORD s_dwLastDepthWarning = 0;
+				DWORD dwNow = GetTickCount();
+				if (s_dwLastDepthWarning == 0 || dwNow - s_dwLastDepthWarning >= 1000)
+				{
+					s_dwLastDepthWarning = (dwNow != 0) ? dwNow : 1;
+					Log(LOG_WARNING, "ConvertLuaToJsonValue - Table nested too deep (depth cap 32 or Lua stack full); replaced with \"<too deep>\"");
+				}
+				if (key && parent.is<JsonObject>())
+				{
+					parent[key] = "<too deep>";
+				}
+				else if (parent.is<JsonArray>())
+				{
+					parent.add("<too deep>");
+				}
+				else
+				{
+					parent.set("<too deep>");
+				}
+				break;
+			}
+
 			// Check if it's an array or object
 			// A Lua table is considered a JSON array ONLY if:
 			// 1. It has only numeric keys
@@ -1874,15 +1923,15 @@ void CvConnectionService::ConvertLuaToJsonValue(lua_State* L, int index, JsonVar
 				isArray = true;
 				for (int i = 1; i <= maxIndex; i++)
 				{
-					lua_pushnumber(L, i);
-					lua_gettable(L, index);
+					// Vox IPC: Raw access, so __index metamethods on game objects never run here
+					lua_rawgeti(L, index, i);
 					if (lua_isnil(L, -1))
 					{
 						isArray = false;
-						lua_pop(L, 1);  // Pop the nil value - key was consumed by lua_gettable
+						lua_pop(L, 1);  // Pop the nil value
 						break;
 					}
-					lua_pop(L, 1);  // Pop the value - key was consumed by lua_gettable
+					lua_pop(L, 1);  // Pop the value
 				}
 			}
 			
@@ -1924,11 +1973,11 @@ void CvConnectionService::ConvertLuaToJsonValue(lua_State* L, int index, JsonVar
 				// Add elements in order (1 to maxIndex)
 				for (int i = 1; i <= maxIndex; i++)
 				{
-					lua_pushnumber(L, i);
-					lua_gettable(L, index);
-					
+					// Vox IPC: Raw access (no __index metamethods)
+					lua_rawgeti(L, index, i);
+
 					// Convert directly into the array ((char*)0 key means add to array)
-					ConvertLuaToJsonValue(L, -1, arr, (char*)0);
+					ConvertLuaToJsonValue(L, -1, arr, (char*)0, iDepth + 1);
 					
 					lua_pop(L, 1);
 				}
@@ -2025,12 +2074,12 @@ void CvConnectionService::ConvertLuaToJsonValue(lua_State* L, int index, JsonVar
 						{
 							// Use the string directly with ArduinoJson to ensure it makes a copy
 							obj[keyStorage] = JsonVariant();
-							ConvertLuaToJsonValue(L, valueIndex, obj[keyStorage], (char*)0);
+							ConvertLuaToJsonValue(L, valueIndex, obj[keyStorage], (char*)0, iDepth + 1);
 						}
 						else
 						{
 							// For string literals and lua strings, use the key directly
-							ConvertLuaToJsonValue(L, valueIndex, obj, key);
+							ConvertLuaToJsonValue(L, valueIndex, obj, key, iDepth + 1);
 						}
 					}
 					else
@@ -2086,8 +2135,25 @@ void CvConnectionService::ConvertLuaToJsonValue(lua_State* L, int index, JsonVar
 }
 
 // Convert a JSON value to Lua and push it onto the stack
-void CvConnectionService::ConvertJsonToLuaValue(lua_State* L, const JsonVariant& value)
+// iDepth: nesting level of this value (0 = top level); containers at the depth cap become nil
+void CvConnectionService::ConvertJsonToLuaValue(lua_State* L, const JsonVariant& value, int iDepth)
 {
+	// Vox IPC: Stop at depth 32 (or when the Lua stack can't grow) and push nil instead of
+	// recursing, so deep JSON args can't overflow the Lua or C stack. Every branch below
+	// still pushes exactly one value.
+	if ((value.is<JsonArray>() || value.is<JsonObject>()) && (iDepth >= 32 || !lua_checkstack(L, 4)))
+	{
+		static DWORD s_dwLastDepthWarning = 0;
+		DWORD dwNow = GetTickCount();
+		if (s_dwLastDepthWarning == 0 || dwNow - s_dwLastDepthWarning >= 1000)
+		{
+			s_dwLastDepthWarning = (dwNow != 0) ? dwNow : 1;
+			Log(LOG_WARNING, "ConvertJsonToLuaValue - JSON nested too deep (depth cap 32 or Lua stack full); replaced with nil");
+		}
+		lua_pushnil(L);
+		return;
+	}
+
 	if (value.isNull())
 	{
 		lua_pushnil(L);
@@ -2102,6 +2168,8 @@ void CvConnectionService::ConvertJsonToLuaValue(lua_State* L, const JsonVariant&
 	}
 	else if (value.is<double>())
 	{
+		// Vox IPC: is<double> is true for every JSON number in ArduinoJson 6.20 (isFloat tests
+		// NUMBER_BIT), so integers beyond int range (signed or unsigned) land here too
 		lua_pushnumber(L, value.as<double>());
 	}
 	else if (value.is<const char*>())
@@ -2116,12 +2184,12 @@ void CvConnectionService::ConvertJsonToLuaValue(lua_State* L, const JsonVariant&
 		lua_newtable(L);
 		
 		// Add array elements
+		// Vox IPC: lua_rawseti (no metamethods; the table is new anyway)
 		int index = 1;
 		for (JsonArray::iterator it = arr.begin(); it != arr.end(); ++it)
 		{
-			lua_pushnumber(L, index);
-			ConvertJsonToLuaValue(L, *it);
-			lua_settable(L, -3);
+			ConvertJsonToLuaValue(L, *it, iDepth + 1);
+			lua_rawseti(L, -2, index);
 			index++;
 		}
 	}
@@ -2133,11 +2201,12 @@ void CvConnectionService::ConvertJsonToLuaValue(lua_State* L, const JsonVariant&
 		lua_newtable(L);
 		
 		// Add object properties
+		// Vox IPC: lua_rawset (no metamethods; the table is new anyway)
 		for (JsonObject::iterator it = obj.begin(); it != obj.end(); ++it)
 		{
 			lua_pushstring(L, it->key().c_str());
-			ConvertJsonToLuaValue(L, it->value());
-			lua_settable(L, -3);
+			ConvertJsonToLuaValue(L, it->value(), iDepth + 1);
+			lua_rawset(L, -3);
 		}
 	}
 	else
@@ -2835,7 +2904,9 @@ std::string CvConnectionService::GenerateCallId()
 {
 	// Use a combination of thread ID, tick count, and counter to ensure uniqueness
 	std::stringstream ss;
-	ss << "call_" << GetCurrentThreadId() << "_" << GetTickCount() << "_" << m_uiNextCallId++;
+	// Vox IPC: Atomic, since the game core and UI threads both make calls
+	LONG lCallNumber = InterlockedIncrement(&m_uiNextCallId) - 1;
+	ss << "call_" << GetCurrentThreadId() << "_" << GetTickCount() << "_" << static_cast<unsigned long>(lCallNumber);
 	return ss.str();
 }
 
@@ -3439,7 +3510,8 @@ bool CvConnectionService::ValidateExternalCall(const char* functionName, Externa
 		result.bSuccess = false;
 		result.strError = "INVALID_FUNCTION";
 		ss << "External function '" << functionName << "' is not registered";
-		Log(LOG_WARNING, result.strError.c_str());
+		// Vox IPC: Log the descriptive message, not the bare error code
+		Log(LOG_WARNING, ss.str().c_str());
 		return false;
 	}
 	
@@ -3457,7 +3529,9 @@ void CvConnectionService::ProcessExternalCallResult(lua_State* L, const External
 		// Parse JSON result and push to Lua
 		if (!result.strData.empty())
 		{
-			DynamicJsonDocument doc(8192);
+			// Vox IPC: Size the pool from the input (a fixed 8 KB failed every reply over ~8 KB).
+			// Deserializing from std::string copies the strings into the pool, hence 2x + slack.
+			DynamicJsonDocument doc(result.strData.length() * 2 + 4096);
 			DeserializationError error = deserializeJson(doc, result.strData);
 			
 			if (!error)
@@ -3473,6 +3547,8 @@ void CvConnectionService::ProcessExternalCallResult(lua_State* L, const External
 				lua_pushstring(L, "SERIALIZATION_ERROR");
 				std::stringstream errorMsg;
 				errorMsg << "Failed to parse JSON result: " << error.c_str();
+				// Vox IPC: This message was built but never logged
+				Log(LOG_WARNING, errorMsg.str().c_str());
 			}
 		}
 		else

@@ -108,7 +108,8 @@ public:
 	int CallExternalFunction(lua_State* L);
 	
 	// Convert JSON to Lua value (made public for use in Lua callbacks)
-	void ConvertJsonToLuaValue(lua_State* L, const JsonVariant& value);
+	// Vox IPC: iDepth is the nesting level; containers deeper than 32 become nil
+	void ConvertJsonToLuaValue(lua_State* L, const JsonVariant& value, int iDepth = 0);
 
 	// Manage paused players
 	void AddPausedPlayer(int iPlayerID);
@@ -212,7 +213,8 @@ private:
 	// a drain nested in Game.CallExternal would otherwise serialize and pop the waiting
 	// call's arguments as if they were results.
 	void ProcessLuaResult(lua_State* L, int executionResult, const char* id, int iStackBase);
-	void ConvertLuaToJsonValue(lua_State* L, int index, JsonVariant parent, const char* key);
+	// Vox IPC: iDepth is the nesting level; tables deeper than 32 become "<too deep>"
+	void ConvertLuaToJsonValue(lua_State* L, int index, JsonVariant parent, const char* key, int iDepth = 0);
 	
 	// Shared function to convert Lua values to fill a key in a JsonDocument
 	void ConvertLuaValuesInDocument(lua_State* L, int firstIndex, int numValues, DynamicJsonDocument& parent, const char* key);
@@ -290,7 +292,7 @@ private:
 	std::map<std::string, ExternalCallResult> m_syncCallResults;
 	
 	// Counter for generating unique call IDs
-	unsigned int m_uiNextCallId;
+	volatile LONG m_uiNextCallId;  // Vox IPC: InterlockedIncrement (game core and UI threads)
 
 	// Vox Deorum: Held for the duration of a drain. The drain was single-threaded until
 	// ProcessMessagesFromUI gave the UI thread a way in, and m_pMainThreadReadBuffer /
