@@ -1,5 +1,8 @@
 # Community-Patch-DLL
 
+> **Branch `vox-ipc-5.4.8` (Joeman4248's fork):** VP 5.4.8 with Vox Deorum's connection service (named-pipe IPC)
+> ported in, off unless `IPC_CHANNEL` = 1. Credits, changes, build and install: [VOX-IPC.md](VOX-IPC.md).
+
 This is the repository for the Civ V SDK + Vox Populi Mod. 
 
 ## What is Vox Populi
