@@ -144,6 +144,7 @@ private:
 	
 	// Handle a single client connection
 	void HandleClientConnection(HANDLE hPipe);
+	void AnnounceRegisteredFunctions(); // Vox IPC: queue lua_register for each known function on connect
 
 	// Queue management methods
 	// Returns the length of the outgoing queue after adding the message
