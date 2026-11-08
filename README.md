@@ -1,7 +1,28 @@
 # Community-Patch-DLL
 
-> **Branch `vox-ipc-5.4.8` (Joeman4248's fork):** VP 5.4.8 with Vox Deorum's connection service (named-pipe IPC)
-> ported in, off unless `IPC_CHANNEL` = 1. Credits, changes, build and install: [VOX-IPC.md](VOX-IPC.md).
+## This fork: the IPC build (branch `vox-ipc-5.4.8`)
+
+This is Joeman4248's fork of the Vox Populi DLL. Branch `vox-ipc-5.4.8` is **VP 5.4.8 with
+[Vox Deorum](https://github.com/vox-deorum/vox-deorum)'s connection service ported in**: an optional named-pipe
+channel that lets a program on the same PC receive the game's events and call Lua functions that mods register,
+for example to connect an AI assistant or other tools to a running game.
+
+- **Off by default.** Nothing changes unless the mod option `IPC_CHANNEL` is set to 1. Gameplay and AI are stock VP
+  5.4.8 either way.
+- **Credit:** the connection service was written by **John Chen ([CIVITAS-John](https://github.com/CIVITAS-John))
+  and the Vox Deorum project**, ported here from their DLL fork
+  [CIVITAS-John/vox-populi](https://github.com/CIVITAS-John/vox-populi). Everything else is the
+  [Community Patch / Vox Populi team](https://github.com/LoneGazebo/Community-Patch-DLL)'s work.
+- **Build with MSVC** (GitHub Actions `build_vp.yml`, artifact `VP_MSVC_Release_*`). The clang build doesn't load
+  in game.
+- **License:** GPL v3 plus the Community Patch EULA, like upstream.
+
+**Full details:** [VOX-IPC.md](VOX-IPC.md) covers credits, licenses, what changed, what was left out, building,
+installing and updating.
+
+The original Vox Populi README follows.
+
+---
 
 This is the repository for the Civ V SDK + Vox Populi Mod. 
 
