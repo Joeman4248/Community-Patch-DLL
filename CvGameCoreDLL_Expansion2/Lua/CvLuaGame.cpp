@@ -4289,7 +4289,7 @@ int CvLuaGame::lProcessConnectionMessages(lua_State* L)
 int CvLuaGame::lUnregisterFunction(lua_State* L)
 {
 	const char* functionName = luaL_checkstring(L, 1);
-	CvConnectionService::GetInstance().UnregisterLuaFunction(functionName);
+	CvConnectionService::GetInstance().UnregisterLuaFunction(functionName, L);
 	return 0;
 }
 

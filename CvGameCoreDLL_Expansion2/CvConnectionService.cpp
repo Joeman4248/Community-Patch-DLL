@@ -37,6 +37,19 @@ left out). Licensed with the rest of this repository (GPL v3 + Community Patch E
 // name again.
 static const char* const s_szFunctionsKey = "VoxDeorum.Functions";
 static const char* const s_szCallbacksKey = "VoxDeorum.Callbacks";
+// Vox IPC: Lua threads that registered functions and async callbacks run on (by function name /
+// call ID). Anchored here so they are never collected while we hold their lua_State pointers.
+static const char* const s_szThreadsKey = "VoxDeorum.Threads";
+static const char* const s_szCallbackThreadsKey = "VoxDeorum.CallbackThreads";
+
+// Callback data structure for Lua external calls
+// The callback function lives in the "VoxDeorum.Callbacks" registry table under strCallId.
+// Vox IPC: L is a thread made for this call, anchored in "VoxDeorum.CallbackThreads" under
+// strCallId, so the callback runs on its own stack and never on a torn-down caller's state.
+struct LuaExternalCallbackData {
+	lua_State* L;
+	std::string strCallId;
+};
 
 // Push one of our private registry tables onto L's stack, creating it if it is missing.
 // Setup creates both tables before any concurrent access. The create-if-missing check is
@@ -112,6 +125,8 @@ CvConnectionService::CvConnectionService()
 	, m_uiNextCallId(1)
 	, m_iProcessingDepth(0)  // Vox Deorum: reentrancy guard for ProcessMessages
 	, m_bUiDrainPolicy(false)  // Vox Deorum: set by whichever drain is outermost
+	, m_dwUiThreadId(0)
+	, m_dwLastUiPumpTick(0)
 	, m_dwLastAITurnDeactivatedTime(0)
 	, m_bAICooldownActive(false)
 	, m_bProductionMode(false)
@@ -121,10 +136,17 @@ CvConnectionService::CvConnectionService()
 	, m_pMainThreadReadBuffer(NULL)
 	, m_pMainThreadWriteBuffer(NULL)
 {
-	// Vox Deorum: Outlives every Setup/Shutdown cycle. Shutdown takes this section to
-	// fence against an in-flight drain before freeing the buffers that drain is reading,
-	// which it could not do with a section of its own making.
+	// Vox IPC: Every section outlives every Setup/Shutdown cycle (see the header). Lua can
+	// reach Register/Unregister/IsExternalRegistered/SendMessage at any time, including
+	// between games and in games without IPC_CHANNEL, so the sections must always exist.
 	InitializeCriticalSection(&m_csProcessing);
+	InitializeCriticalSection(&m_csIncoming);
+	InitializeCriticalSection(&m_csOutgoing);
+	InitializeCriticalSection(&m_csFunctions);
+	InitializeCriticalSection(&m_csExternalFunctions);
+	InitializeCriticalSection(&m_csPendingCalls);
+	InitializeCriticalSection(&m_csPausedPlayers);
+	InitializeCriticalSection(&m_csEventSequence);
 }
 
 // Destructor
@@ -135,8 +157,15 @@ CvConnectionService::~CvConnectionService()
 		Shutdown();
 	}
 
-	// Vox Deorum: Safe here and nowhere earlier — Shutdown above has already fenced out
-	// every drain, and the singleton is going away with the process.
+	// Safe here and nowhere earlier: Shutdown above has fenced out every drain, and the
+	// singleton is going away with the process.
+	DeleteCriticalSection(&m_csEventSequence);
+	DeleteCriticalSection(&m_csPausedPlayers);
+	DeleteCriticalSection(&m_csPendingCalls);
+	DeleteCriticalSection(&m_csExternalFunctions);
+	DeleteCriticalSection(&m_csFunctions);
+	DeleteCriticalSection(&m_csOutgoing);
+	DeleteCriticalSection(&m_csIncoming);
 	DeleteCriticalSection(&m_csProcessing);
 }
 
@@ -190,15 +219,7 @@ bool CvConnectionService::Setup()
 	m_pMainThreadReadBuffer = new DynamicJsonDocument(524288);
 	m_pMainThreadWriteBuffer = new DynamicJsonDocument(524288);
 
-	// Initialize critical sections for thread safety
-	InitializeCriticalSection(&m_csIncoming);
-	InitializeCriticalSection(&m_csOutgoing);
-	InitializeCriticalSection(&m_csFunctions);
-	InitializeCriticalSection(&m_csExternalFunctions);
-	InitializeCriticalSection(&m_csPendingCalls);
-	InitializeCriticalSection(&m_csPausedPlayers);  // Vox Deorum: For thread-safe access to paused players list
-	// Vox Deorum: m_csProcessing is deliberately absent — it is owned by the constructor
-	// so that Shutdown can fence drains out with it. See its declaration.
+	// Vox IPC: critical sections are created once, in the constructor (see the header).
 
 	// Reset shutdown flag
 	m_bShutdownRequested = false;
@@ -228,6 +249,8 @@ bool CvConnectionService::Setup()
 	// table that already exists (from an earlier load, or an early registration) is kept.
 	PushPrivateTable(m_pLuaState, s_szFunctionsKey);
 	PushPrivateTable(m_pLuaState, s_szCallbacksKey);
+	PushPrivateTable(m_pLuaState, s_szThreadsKey);
+	PushPrivateTable(m_pLuaState, s_szCallbackThreadsKey);
 	lua_settop(m_pLuaState, 0);
 
 	Log(LOG_INFO, "ConnectionService::Setup() - Lua state initialized, creating named pipe server");
@@ -246,6 +269,14 @@ bool CvConnectionService::Setup()
 		std::stringstream ss;
 		ss << "ConnectionService::Setup() - Failed to create thread, error: " << GetLastError();
 		Log(LOG_ERROR, ss.str().c_str());
+
+		// Vox IPC: undo the allocations above so a later Setup starts clean
+		m_pkScriptSystem->FreeLuaThread(m_pLuaState);
+		m_pLuaState = NULL;
+		delete m_pMainThreadReadBuffer;
+		m_pMainThreadReadBuffer = NULL;
+		delete m_pMainThreadWriteBuffer;
+		m_pMainThreadWriteBuffer = NULL;
 		return false;
 	}
 
@@ -297,30 +328,31 @@ void CvConnectionService::Shutdown()
 	// the next drain — including one already on its way in from a UI update, which is not
 	// on this thread and does not stop when the game core does — halts at the initialized
 	// check rather than reaching the critical sections and JSON buffers freed below.
-	EnterCriticalSection(&m_csProcessing);
-	m_bInitialized = false;
-	LeaveCriticalSection(&m_csProcessing);
+	// Vox IPC: Release the game-core lock while waiting. A UI-thread drain may be running a
+	// RunLua script whose game calls need that lock; holding it here while that drain waits
+	// for it would deadlock the game on exit or reload.
+	{
+		bool bHadLock = gDLL->HasGameCoreLock();
+		if (bHadLock)
+		{
+			gDLL->ReleaseGameCoreLock();
+		}
+		EnterCriticalSection(&m_csProcessing);
+		m_bInitialized = false;
+		LeaveCriticalSection(&m_csProcessing);
+		if (bHadLock)
+		{
+			gDLL->GetGameCoreLock();
+		}
+	}
 
 	// Save event sequence before shutting down
 	SerializeEventSequence();
 
-	// Signal the thread to shutdown
+	// Signal the thread to shutdown. Vox IPC: the pipe thread owns its handle and closes it
+	// itself (it is non-blocking and checks this flag within ~100 ms). Closing it from here
+	// raced with the thread's own close, and a reused handle number could be closed twice.
 	m_bShutdownRequested = true;
-	
-	// Force disconnect any connected client first
-	m_bClientConnected = false;
-
-	// Close the pipe if it's open to wake up the thread
-	if (m_hPipe != INVALID_HANDLE_VALUE)
-	{
-		// Cancel any pending I/O operations
-		CancelIo(m_hPipe);
-		
-		// Disconnect and close the pipe
-		DisconnectNamedPipe(m_hPipe);
-		CloseHandle(m_hPipe);
-		m_hPipe = INVALID_HANDLE_VALUE;
-	}
 
 	// Wait for the thread to finish (max 5 seconds)
 	if (m_hThread != NULL)
@@ -342,33 +374,52 @@ void CvConnectionService::Shutdown()
 		m_hThread = NULL;
 	}
 
-	// Clean up Lua state
+	// Clear all registered Lua functions
+	EnterCriticalSection(&m_csFunctions);
+	m_registeredFunctions.clear();
+	LeaveCriticalSection(&m_csFunctions);
+
+	// Clear any pending external calls. Vox IPC: free async callback data too (it leaked).
+	EnterCriticalSection(&m_csPendingCalls);
+	for (std::map<std::string, PendingExternalCall>::iterator it = m_pendingExternalCalls.begin();
+		it != m_pendingExternalCalls.end(); ++it)
+	{
+		if (it->second.pCallback && it->second.pUserData)
+		{
+			delete static_cast<LuaExternalCallbackData*>(it->second.pUserData);
+		}
+	}
+	m_pendingExternalCalls.clear();
+	m_syncCallResults.clear();
+	LeaveCriticalSection(&m_csPendingCalls);
+
+	// Vox IPC: the bridge's external functions belong to this connection; a new game starts
+	// with none (IsExternalRegistered stayed true after a reload).
+	EnterCriticalSection(&m_csExternalFunctions);
+	m_externalFunctions.clear();
+	LeaveCriticalSection(&m_csExternalFunctions);
+
+	EnterCriticalSection(&m_csPausedPlayers);
+	m_pausedPlayers.clear();
+	LeaveCriticalSection(&m_csPausedPlayers);
+
+	// Clean up Lua state. Vox IPC: drop our registry tables first, so the threads anchored
+	// there (and the UI globals they reference) can be collected with the old game.
 	if (m_pkScriptSystem && m_pLuaState)
 	{
+		const char* aszKeys[] = { s_szFunctionsKey, s_szCallbacksKey, s_szThreadsKey, s_szCallbackThreadsKey };
+		for (int i = 0; i < 4; i++)
+		{
+			lua_pushstring(m_pLuaState, aszKeys[i]);
+			lua_pushnil(m_pLuaState);
+			lua_rawset(m_pLuaState, LUA_REGISTRYINDEX);
+		}
 		m_pkScriptSystem->FreeLuaThread(m_pLuaState);
 		m_pLuaState = NULL;
 		Log(LOG_INFO, "ConnectionService::Shutdown() - Lua state freed");
 	}
 
-	// Clear all registered Lua functions
-	EnterCriticalSection(&m_csFunctions);
-	m_registeredFunctions.clear();
-	LeaveCriticalSection(&m_csFunctions);
-	
-	// Clear any pending external calls
-	EnterCriticalSection(&m_csPendingCalls);
-	m_pendingExternalCalls.clear();
-	m_syncCallResults.clear();
-	LeaveCriticalSection(&m_csPendingCalls);
-
-	// Clean up critical sections
-	DeleteCriticalSection(&m_csIncoming);
-	DeleteCriticalSection(&m_csOutgoing);
-	DeleteCriticalSection(&m_csFunctions);
-	DeleteCriticalSection(&m_csExternalFunctions);
-	DeleteCriticalSection(&m_csPendingCalls);
-	DeleteCriticalSection(&m_csPausedPlayers);  // Vox Deorum: Clean up paused players critical section
-	// Vox Deorum: m_csProcessing survives — the destructor owns it. See its declaration.
+	// Vox IPC: critical sections stay; the destructor deletes them (see the header).
 
 	// Free the JSON buffers
 	if (m_pMainThreadReadBuffer)
@@ -382,15 +433,20 @@ void CvConnectionService::Shutdown()
 		m_pMainThreadWriteBuffer = NULL;
 	}
 
-	// Clear any remaining messages in the queues
+	// Clear any remaining messages in the queues (Vox IPC: under their locks, since the
+	// sections now always exist and the UI thread may still be queuing)
+	EnterCriticalSection(&m_csIncoming);
 	while (!m_incomingQueue.empty())
 	{
 		m_incomingQueue.pop();
 	}
+	LeaveCriticalSection(&m_csIncoming);
+	EnterCriticalSection(&m_csOutgoing);
 	while (!m_outgoingQueue.empty())
 	{
 		m_outgoingQueue.pop();
 	}
+	LeaveCriticalSection(&m_csOutgoing);
 
 	m_bInitialized = false;
 	m_bClientConnected = false;
@@ -910,7 +966,50 @@ void CvConnectionService::ProcessMessages()
 // caller is and is not allowed to route.
 void CvConnectionService::ProcessMessagesFromUI()
 {
+	// Vox IPC: heartbeat for the UI-thread pump (see m_dwUiThreadId in the header). Plain
+	// aligned DWORD stores, read without a lock on the other thread.
+	m_dwUiThreadId = GetCurrentThreadId();
+	m_dwLastUiPumpTick = GetTickCount();
 	DrainIncomingMessages(DRAIN_UI);
+}
+
+// Vox IPC: whether a UI add-in pumped recently enough to own Lua-running messages
+bool CvConnectionService::IsUiPumpActive() const
+{
+	return m_dwUiThreadId != 0 && (GetTickCount() - m_dwLastUiPumpTick) < UI_PUMP_TIMEOUT_MS;
+}
+
+bool CvConnectionService::IsOnUiThread() const
+{
+	return GetCurrentThreadId() == m_dwUiThreadId;
+}
+
+// Vox IPC: whether routing this (already parsed) message would run Lua
+bool CvConnectionService::MessageRunsLua(const std::string& messageType)
+{
+	if (messageType == "lua_execute" || messageType == "lua_call")
+	{
+		return true;
+	}
+	if (messageType == "external_response")
+	{
+		// Only an async call runs Lua (its callback); a sync result is just stored
+		const char* rawCallId = (*m_pMainThreadReadBuffer)["id"];
+		if (rawCallId == NULL)
+		{
+			return false;
+		}
+		bool bAsync = false;
+		EnterCriticalSection(&m_csPendingCalls);
+		std::map<std::string, PendingExternalCall>::iterator it = m_pendingExternalCalls.find(rawCallId);
+		if (it != m_pendingExternalCalls.end())
+		{
+			bAsync = (it->second.pCallback != NULL);
+		}
+		LeaveCriticalSection(&m_csPendingCalls);
+		return bAsync;
+	}
+	return false;
 }
 
 // Vox Deorum: Whether this message type has to wait for a game-core pump point.
@@ -925,6 +1024,13 @@ bool CvConnectionService::IsGameCoreOnlyMessageType(const std::string& messageTy
 // the synchronous external-call wait loop is the one caller allowed through.
 void CvConnectionService::DrainIncomingMessages(DrainCaller eCaller)
 {
+	// Vox IPC: while a UI pump is alive it owns the queue; game-core pump points (every game
+	// event, every CvGame::update) then cost nothing. See m_dwUiThreadId in the header.
+	if (eCaller == DRAIN_GAME_CORE && IsUiPumpActive() && !IsOnUiThread())
+	{
+		return;
+	}
+
 	// Scope-bound so every path out of here — the early returns below, or a throw escaping
 	// the routing loop — pops the depth and releases the section.
 	DrainScope kScope(m_csProcessing, m_iProcessingDepth);
@@ -1031,7 +1137,7 @@ void CvConnectionService::DrainIncomingMessages(DrainCaller eCaller)
 			{
 				std::stringstream ss;
 				ss << "DrainIncomingMessages - Deferred " << deferredMessages.size()
-					<< " game-core-only message(s) to the next game-core pump";
+					<< " message(s) to a later pump on the right thread";
 				Log(LOG_DEBUG, ss.str().c_str());
 			}
 
@@ -1163,6 +1269,14 @@ bool CvConnectionService::RouteMessage(const std::string& messageJson, bool bUiP
 	// next game-core pump. Checked before any handler runs so the decision cannot depend
 	// on work already half-applied.
 	if (bUiPolicy && IsGameCoreOnlyMessageType(messageType))
+	{
+		return false;
+	}
+
+	// Vox IPC: with a UI pump alive, Lua runs only on the UI thread. Reached off that thread
+	// only by a game-core DRAIN_AWAIT (sync Game.CallExternal from game-core Lua), which still
+	// gets its own external_response because storing a sync result runs no Lua.
+	if (IsUiPumpActive() && !IsOnUiThread() && MessageRunsLua(messageType))
 	{
 		return false;
 	}
@@ -1406,7 +1520,10 @@ void CvConnectionService::HandleLuaCall(const char* functionName, const JsonArra
 	// Get the function info
 	LuaFunctionInfo funcInfo = it->second;
 	LeaveCriticalSection(&m_csFunctions);
-	
+
+	// Vox IPC: run on the function's own anchored thread (see LuaFunctionInfo)
+	lua_State* L = funcInfo.pCallState;
+
 	// Handle thread locks for safe Lua execution
 	bool bHadLock = gDLL->HasGameCoreLock();
 	if (bHadLock)
@@ -1418,11 +1535,11 @@ void CvConnectionService::HandleLuaCall(const char* functionName, const JsonArra
 	// already be mid-call — a Lua function reached through an earlier lua_call may be
 	// sitting inside Game.CallExternal, whose wait loop is what drained us — and its
 	// arguments are on this same frame. See ProcessLuaResult's declaration.
-	const int iStackBase = lua_gettop(funcInfo.pLuaState);
+	const int iStackBase = lua_gettop(L);
 
 	// Push the function from our private registry table. If the entry is gone, answer
 	// INVALID_FUNCTION so the MCP server registers it again and retries.
-	if (!PushPrivateFunction(funcInfo.pLuaState, s_szFunctionsKey, functionName))
+	if (!PushPrivateFunction(L, s_szFunctionsKey, functionName))
 	{
 		if (bHadLock)
 		{
@@ -1448,15 +1565,15 @@ void CvConnectionService::HandleLuaCall(const char* functionName, const JsonArra
 	int argCount = 0;
 	for (JsonArray::iterator argIt = args.begin(); argIt != args.end(); ++argIt)
 	{
-		ConvertJsonToLuaValue(funcInfo.pLuaState, *argIt);
+		ConvertJsonToLuaValue(L, *argIt);
 		argCount++;
 	}
 
 	// Call the function (argCount args, LUA_MULTRET results)
-	int result = lua_pcall(funcInfo.pLuaState, argCount, LUA_MULTRET, 0);
+	int result = lua_pcall(L, argCount, LUA_MULTRET, 0);
 
 	// Process the result
-	ProcessLuaResult(funcInfo.pLuaState, result, id, iStackBase);
+	ProcessLuaResult(L, result, id, iStackBase);
 	
 	// Restore game core lock if we had it
 	if (bHadLock)
@@ -1983,14 +2100,12 @@ void CvConnectionService::ConvertJsonToLuaValue(lua_State* L, const JsonVariant&
 void CvConnectionService::RegisterLuaFunction(const char* name, lua_State* L, int stackIndex)
 {
 	EnterCriticalSection(&m_csFunctions);
-	
-	// Check for existing registration and clear it from the old state's table, in case it
-	// was registered from a state with a different registry
-	std::map<std::string, LuaFunctionInfo>::iterator it = m_registeredFunctions.find(name);
-	if (it != m_registeredFunctions.end())
-	{
-		ClearPrivateEntry(it->second.pLuaState, s_szFunctionsKey, name);
 
+	// Vox IPC: an existing registration is simply overwritten below. Every state shares one
+	// registry, so there is nothing to clear in the old state, and the old state may be a
+	// torn-down context: touching it (as this used to) could crash.
+	if (m_registeredFunctions.find(name) != m_registeredFunctions.end())
+	{
 		char buffer[512];
 		sprintf_s(buffer, sizeof(buffer), "Overwriting existing registration for function: %s", name);
 		Log(LOG_INFO, buffer);
@@ -2000,21 +2115,31 @@ void CvConnectionService::RegisterLuaFunction(const char* name, lua_State* L, in
 	lua_pushvalue(L, stackIndex);
 	SetPrivateEntry(L, s_szFunctionsKey, name);
 
+	// Vox IPC: a thread for calls, sharing this context's globals but with its own stack,
+	// anchored in the registry (lua_newthread pushes it; SetPrivateEntry stores and pops it)
+	lua_State* pCallState = lua_newthread(L);
+	SetPrivateEntry(L, s_szThreadsKey, name);
+
 	// Store the function info
 	LuaFunctionInfo info;
 	info.pLuaState = L;
+	info.pCallState = pCallState;
 	info.strDescription = "Registered from Lua";  // Could be enhanced with optional description parameter
-	
+
 	m_registeredFunctions[name] = info;
 	LeaveCriticalSection(&m_csFunctions);
-	
-	// Send registration notification to Bridge
-	DynamicJsonDocument message(512);
-	message["type"] = "lua_register";
-	message["function"] = name;
-	message["description"] = info.strDescription.c_str();
-	SendMessage(message);
-	
+
+	// Send registration notification to Bridge (Vox IPC: only when set up; a bridge that
+	// connects later is told about every function on connect)
+	if (m_bInitialized)
+	{
+		DynamicJsonDocument message(512);
+		message["type"] = "lua_register";
+		message["function"] = name;
+		message["description"] = info.strDescription.c_str();
+		SendMessage(message);
+	}
+
 	char buffer[512];
 	sprintf_s(buffer, sizeof(buffer), "Registered Lua function: %s (L=%p)", name, L);
 	Log(LOG_INFO, buffer);
@@ -2022,32 +2147,37 @@ void CvConnectionService::RegisterLuaFunction(const char* name, lua_State* L, in
 
 //------------------------------------------------------------------------------
 // Unregister a specific function
-void CvConnectionService::UnregisterLuaFunction(const char* name)
+void CvConnectionService::UnregisterLuaFunction(const char* name, lua_State* L)
 {
 	EnterCriticalSection(&m_csFunctions);
-	
+
 	std::map<std::string, LuaFunctionInfo>::iterator it = m_registeredFunctions.find(name);
 	if (it != m_registeredFunctions.end())
 	{
-		// Clear the function from our private registry table
-		ClearPrivateEntry(it->second.pLuaState, s_szFunctionsKey, name);
+		// Clear the function and its call thread from our private registry tables, through
+		// the caller's (live) state. Vox IPC: never through the registering state.
+		ClearPrivateEntry(L, s_szFunctionsKey, name);
+		ClearPrivateEntry(L, s_szThreadsKey, name);
 
 		// Remove from map
 		m_registeredFunctions.erase(it);
-		
+
 		char buffer[512];
 		sprintf_s(buffer, sizeof(buffer), "Unregistered Lua function: %s", name);
 		Log(LOG_INFO, buffer);
 	}
-	
+
 	LeaveCriticalSection(&m_csFunctions);
-	
+
 	// Send unregistration notification to Bridge
-	DynamicJsonDocument message(512);
-	message["type"] = "lua_unregister";
-	message["function"] = name;
-	SendMessage(message);
-}\
+	if (m_bInitialized)
+	{
+		DynamicJsonDocument message(512);
+		message["type"] = "lua_unregister";
+		message["function"] = name;
+		SendMessage(message);
+	}
+}
 
 //------------------------------------------------------------------------------
 // Forward game events to the Bridge Service
@@ -2374,6 +2504,11 @@ void CvConnectionService::ForwardGameEvent(const char* eventName, ICvEngineScrip
 		}
 		LeaveCriticalSection(&m_csFunctions);
 
+		// Vox IPC: results the post-processor left on its thread; popped only after the
+		// message is serialized, because ArduinoJson keeps Lua's string pointers
+		lua_State* pPostState = hasPostProcessor ? postProcessorInfo.pCallState : NULL;
+		int iPostResults = 0;
+
 		if (hasPostProcessor)
 		{
 			// Call the Lua function with eventName and payload
@@ -2385,18 +2520,18 @@ void CvConnectionService::ForwardGameEvent(const char* eventName, ICvEngineScrip
 
 			// Push the function from our private registry table, skipping post-processing
 			// if the entry is gone
-			bool bHasFunction = PushPrivateFunction(postProcessorInfo.pLuaState, s_szFunctionsKey, "!PostProcessGameEvent");
+			bool bHasFunction = PushPrivateFunction(pPostState, s_szFunctionsKey, "!PostProcessGameEvent");
 			int result = 0;
 			if (bHasFunction)
 			{
 				// Push arguments: eventName (string) and payload (table)
-				lua_pushstring(postProcessorInfo.pLuaState, eventName);
+				lua_pushstring(pPostState, eventName);
 
 				// Convert JSON payload to Lua table
-				ConvertJsonToLuaValue(postProcessorInfo.pLuaState, payload);
+				ConvertJsonToLuaValue(pPostState, payload);
 
 				// Call the function (2 args, 2 results)
-				result = lua_pcall(postProcessorInfo.pLuaState, 2, 2, 0);
+				result = lua_pcall(pPostState, 2, 2, 0);
 			}
 
 			if (!bHasFunction)
@@ -2407,26 +2542,26 @@ void CvConnectionService::ForwardGameEvent(const char* eventName, ICvEngineScrip
 			{
 				// Success - get the return values
 				// First return value: extraPayload
-				if (!lua_isnil(postProcessorInfo.pLuaState, -2))
+				if (!lua_isnil(pPostState, -2))
 				{
 					// Convert first return value to JSON and store as extraPayload
-					ConvertLuaToJsonValue(postProcessorInfo.pLuaState, -2, message.as<JsonObject>(), "extraPayload");
+					ConvertLuaToJsonValue(pPostState, -2, message.as<JsonObject>(), "extraPayload");
 				}
 
 				// Second return value: visibility
-				if (!lua_isnil(postProcessorInfo.pLuaState, -1))
+				if (!lua_isnil(pPostState, -1))
 				{
 					// Convert second return value to JSON and store as visibility
-					ConvertLuaToJsonValue(postProcessorInfo.pLuaState, -1, message.as<JsonObject>(), "visibility");
+					ConvertLuaToJsonValue(pPostState, -1, message.as<JsonObject>(), "visibility");
 				}
 
-				// Pop both return values
-				lua_pop(postProcessorInfo.pLuaState, 2);
+				// Vox IPC: popped after SendMessage below
+				iPostResults = 2;
 			}
 			else
 			{
 				// Error - log warning and continue
-				const char* errorMsg = lua_tostring(postProcessorInfo.pLuaState, -1);
+				const char* errorMsg = lua_tostring(pPostState, -1);
 				std::string cleanedError = CleanLuaErrorMessage(errorMsg);
 
 				std::stringstream logMsg;
@@ -2434,7 +2569,7 @@ void CvConnectionService::ForwardGameEvent(const char* eventName, ICvEngineScrip
 				Log(LOG_WARNING, logMsg.str().c_str());
 
 				// Pop the error message
-				lua_pop(postProcessorInfo.pLuaState, 1);
+				lua_pop(pPostState, 1);
 			}
 
 			// Restore game core lock if we had it
@@ -2479,6 +2614,12 @@ void CvConnectionService::ForwardGameEvent(const char* eventName, ICvEngineScrip
 			std::stringstream ss;
 			ss << "ForwardGameEvent - Skipping event '" << eventName << "' with arguments " << argCount;
 			Log(LOG_DEBUG, ss.str().c_str());
+		}
+
+		// Vox IPC: the message is serialized now; drop the post-processor's results
+		if (iPostResults > 0)
+		{
+			lua_pop(pPostState, iPostResults);
 		}
 	}
 	catch (...)
@@ -2652,26 +2793,37 @@ unsigned long long CvConnectionService::GenerateEventId()
 	// Get current turn from the game
 	unsigned int currentTurn = 0;
 	currentTurn = GC.getGame().getGameTurn();
-	
+
+	// Vox IPC: game events (game-core thread) and Lua broadcasts (UI thread) both get ids
+	EnterCriticalSection(&m_csEventSequence);
+
 	// If turn has changed, reset event sequence
 	if (currentTurn != m_uiCurrentTurn)
 	{
 		m_uiCurrentTurn = currentTurn;
 		m_uiEventSequence = 1;
 	}
-	
+
 	// Generate event ID: (turn * 1000000) + eventSequence
 	unsigned long long eventId = (unsigned long long)m_uiCurrentTurn * 1000000ULL + m_uiEventSequence;
-	
+
 	// Increment sequence for next event
 	m_uiEventSequence++;
-	
+
+	LeaveCriticalSection(&m_csEventSequence);
 	return eventId;
 }
 
 // Serialize m_uiEventSequence to database
 void CvConnectionService::SerializeEventSequence()
 {
+	// Vox IPC: saves can happen while the service isn't set up (Setup failed, or between
+	// games); luaL_dostring on a NULL state would crash the game
+	if (m_pLuaState == NULL)
+	{
+		return;
+	}
+
 	// Build Lua script to save event sequence
 	std::stringstream script;
 	script << "local saveDB = Modding.OpenSaveData();\n";
@@ -2865,13 +3017,6 @@ std::string CvConnectionService::CleanLuaErrorMessage(const char* errorMsg)
 	return cleanedError;
 }
 
-// Callback data structure for Lua external calls
-// The callback function lives in the "VoxDeorum.Callbacks" registry table under strCallId.
-struct LuaExternalCallbackData {
-	lua_State* L;
-	std::string strCallId;
-};
-
 // Static callback function for external calls
 void CvConnectionService::HandleExternalCallCallback(const ExternalCallResult& result, void* userData)
 {
@@ -2910,8 +3055,10 @@ void CvConnectionService::HandleExternalCallCallback(const ExternalCallResult& r
 			CvConnectionService::GetInstance().Log(CvConnectionService::LOG_WARNING, logMsg.str().c_str());
 		}
 
-		// Clean up the callback entry
+		// Clean up the callback entry and (Vox IPC) the call's thread anchor, last: pData->L
+		// stays valid while we still use it
 		ClearPrivateEntry(pData->L, s_szCallbacksKey, pData->strCallId.c_str());
+		ClearPrivateEntry(pData->L, s_szCallbackThreadsKey, pData->strCallId.c_str());
 
 		// Restore game core lock if we had it
 		if (bHadLock)
@@ -2996,12 +3143,15 @@ int CvConnectionService::CallExternalFunction(lua_State* L)
 	{
 		// Create callback data
 		LuaExternalCallbackData* pCallbackData = new LuaExternalCallbackData;
-		pCallbackData->L = L;
 		pCallbackData->strCallId = callId;
 
 		// Store the callback function in our private registry table under the call ID
 		lua_pushvalue(L, callbackIndex);
 		SetPrivateEntry(L, s_szCallbacksKey, callId.c_str());
+
+		// Vox IPC: the callback runs later on its own anchored thread (see the struct)
+		pCallbackData->L = lua_newthread(L);
+		SetPrivateEntry(L, s_szCallbackThreadsKey, callId.c_str());
 
 		// Set the callback function pointer
 		callback = HandleExternalCallCallback;
@@ -3021,13 +3171,15 @@ int CvConnectionService::CallExternalFunction(lua_State* L)
 	m_pendingExternalCalls[callId] = pendingCall;
 	LeaveCriticalSection(&m_csPendingCalls);
 	
-	// Create the call request message
-	DynamicJsonDocument request(8192);
+	// Create the call request message. Vox IPC: 64 KB of nodes (was 8 KB; strings are
+	// stored by pointer, so this bounds the argument tables' size, not their text), and an
+	// overflow is reported instead of silently sending truncated arguments.
+	DynamicJsonDocument request(65536);
 	request["type"] = "external_call";
 	request["id"] = callId;
 	request["function"] = functionName;
 	request["async"] = hasCallback;
-	
+
 	// Convert Lua arguments directly to JSON without intermediate string serialization
 	// Important: numArgs was already decremented if there was a callback, so it doesn't include the callback
 	// Arguments start at index 2 (after function name at index 1)
@@ -3037,7 +3189,27 @@ int CvConnectionService::CallExternalFunction(lua_State* L)
 		// Use the shared conversion function to convert Lua values directly to JsonVariant
 		ConvertLuaValuesInDocument(L, 2, actualArgCount, request, "args");
 	}
-	
+
+	if (request.overflowed())
+	{
+		EnterCriticalSection(&m_csPendingCalls);
+		m_pendingExternalCalls.erase(callId);
+		LeaveCriticalSection(&m_csPendingCalls);
+		if (hasCallback)
+		{
+			LuaExternalCallbackData* pCallbackData = static_cast<LuaExternalCallbackData*>(userData);
+			ClearPrivateEntry(L, s_szCallbacksKey, callId.c_str());
+			ClearPrivateEntry(L, s_szCallbackThreadsKey, callId.c_str());
+			delete pCallbackData;
+		}
+		Log(LOG_ERROR, "CallExternalFunction - Arguments too large for the request document");
+		// Same shape as a failed sync call (no luaL_error: its longjmp would skip the C++
+		// destructors of the locals here)
+		lua_pushnil(L);
+		lua_pushstring(L, "ARGS_TOO_LARGE");
+		return 2;
+	}
+
 	// Send the request
 	SendMessage(request);
 	
@@ -3102,12 +3274,15 @@ int CvConnectionService::CallExternalFunction(lua_State* L)
 						static_cast<LuaExternalCallbackData*>(pendingIt->second.pUserData);
 					if (pCallbackData && pCallbackData->L)
 					{
-						ClearPrivateEntry(pCallbackData->L, s_szCallbacksKey, pCallbackData->strCallId.c_str());
+						ClearPrivateEntry(L, s_szCallbacksKey, pCallbackData->strCallId.c_str());
+						ClearPrivateEntry(L, s_szCallbackThreadsKey, pCallbackData->strCallId.c_str());
 						delete pCallbackData;
 					}
 				}
 				m_pendingExternalCalls.erase(pendingIt);
 			}
+			// Vox IPC: a reply that landed between the last check and here would stay forever
+			m_syncCallResults.erase(callId);
 			LeaveCriticalSection(&m_csPendingCalls);
 			
 			std::stringstream timeoutMsg;

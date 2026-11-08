@@ -67,8 +67,10 @@ public:
 	// Register a Lua function for external calling
 	void RegisterLuaFunction(const char* name, lua_State* L, int stackIndex);
 	
-	// Unregister a specific function
-	void UnregisterLuaFunction(const char* name);
+	// Unregister a specific function. L is the caller's state (any live thread of the
+	// shared Lua universe works for the registry); never the state that registered it,
+	// which may already be gone.
+	void UnregisterLuaFunction(const char* name, lua_State* L);
 
 	// Forward game events to the Bridge Service
 	void ForwardGameEvent(const char* eventName, class ICvEngineScriptSystemArgs1* args);
@@ -217,7 +219,11 @@ private:
 	// Structure to store registered Lua functions. The function itself lives in the
 	// "VoxDeorum.Functions" registry table under its name (see CvConnectionService.cpp).
 	struct LuaFunctionInfo {
-		lua_State* pLuaState;      // The Lua state that registered this function
+		lua_State* pLuaState;      // The Lua state that registered this function (informational only)
+		lua_State* pCallState;     // Vox IPC: a thread made from pLuaState at registration and anchored
+		                           // in the "VoxDeorum.Threads" registry table, so calls get their own
+		                           // stack (never the registering context's) with that context's globals,
+		                           // and stay valid even if the registering context is torn down
 		std::string strDescription; // Optional description for documentation
 	};
 	
@@ -256,12 +262,18 @@ private:
 	std::queue<std::string> m_incomingQueue;  // Bridge -> Game (stores stripped JSON)
 	std::queue<std::string> m_outgoingQueue;  // Game -> Bridge (stores wrapped JSON)
 	
-	// Critical sections for thread safety
+	// Critical sections for thread safety.
+	// Vox IPC: every section (these, m_csPendingCalls and m_csProcessing) lives for the whole
+	// process: created in the constructor, deleted in the destructor. They used to be created in
+	// Setup and deleted in Shutdown, so a UI add-in calling Game.RegisterFunction while a save was
+	// loading (after the old game's Shutdown, before the new game's Setup) entered a deleted
+	// section and crashed the game. Shutdown now only clears the data they guard.
 	CRITICAL_SECTION m_csIncoming;
 	CRITICAL_SECTION m_csOutgoing;
 	CRITICAL_SECTION m_csFunctions;
 	CRITICAL_SECTION m_csExternalFunctions;
 	CRITICAL_SECTION m_csPausedPlayers;  // Vox Deorum: For thread-safe access to paused players list
+	CRITICAL_SECTION m_csEventSequence;  // Vox IPC: GenerateEventId runs on the game-core and UI threads
 	
 	// Map of function name to function info
 	std::map<std::string, LuaFunctionInfo> m_registeredFunctions;
@@ -287,16 +299,32 @@ private:
 	// on the other. Recursive by nature, so same-thread nesting is still decided by
 	// m_iProcessingDepth below.
 	//
-	// Unlike the sections above, this one lives across Setup/Shutdown cycles — it is
-	// created in the constructor and destroyed in the destructor. Shutdown frees the very
-	// buffers a drain is using, so it has to be able to take this section to fence against
-	// an in-flight drain; a section that Shutdown itself destroys could not do that.
+	// Like every section here, it lives across Setup/Shutdown cycles. Shutdown frees the
+	// very buffers a drain is using, so it takes this section to fence against an in-flight
+	// drain.
 	CRITICAL_SECTION m_csProcessing;
 
 	// Vox Deorum: Routing policy of the outermost drain currently on the stack, so a
 	// nested DRAIN_AWAIT inherits it instead of quietly widening what may run. Only
 	// meaningful while m_iProcessingDepth is above zero, and written under m_csProcessing.
 	bool m_bUiDrainPolicy;
+
+	// Vox IPC: UI-thread pump. A UI add-in (the Claude Bridge mod) calls
+	// Game.ProcessConnectionMessages every frame. While it does (a pump in the last
+	// UI_PUMP_TIMEOUT_MS), every message that runs Lua (lua_execute, lua_call, async
+	// external_response callbacks) runs only on that UI thread, where the engine runs all UI
+	// Lua, instead of on the game-core thread in the middle of game-core work: the DLL has no
+	// way to take the engine's Lua lock, so Lua from the game-core thread could run at the
+	// same time as UI Lua in the same Lua universe. Game-core drains then skip entirely, and a
+	// game-core DRAIN_AWAIT routes only what runs no Lua (a sync external_response). Without a
+	// pump (no add-in, load screen, minimized) everything falls back to the old routing.
+	volatile DWORD m_dwUiThreadId;
+	volatile DWORD m_dwLastUiPumpTick;
+	static const DWORD UI_PUMP_TIMEOUT_MS = 2000;
+	bool IsUiPumpActive() const;
+	bool IsOnUiThread() const;
+	// Whether the parsed message in m_pMainThreadReadBuffer would run Lua when routed.
+	bool MessageRunsLua(const std::string& messageType);
 
 	// Vox Deorum: Number of drains currently on the stack, always read and written under
 	// m_csProcessing. ForwardGameEvent can call ProcessMessages from inside Lua event
