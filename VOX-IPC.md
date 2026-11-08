@@ -38,7 +38,7 @@ CC BY-NC-SA 4.0. Nothing from it is included here beyond the DLL code from their
 
 ## What this branch changes
 
-Three commits on top of the tag `Release-5.4.8`:
+Three commits on top of the tag `Release-5.4.8` (plus the hardening pass below):
 
 1. **Port Vox Deorum connection service to VP 5.4.8**
    - `CvConnectionService.cpp/.h` and `CvConnectionSchema.cpp/.h`: a pipe server on
@@ -58,6 +58,47 @@ Three commits on top of the tag `Release-5.4.8`:
 
 **Left out of Vox Deorum on purpose:** its reinforcement-learning capture, its tactical AI and flavor changes,
 player pausing and `SetVoxDeorumMode`.
+
+## Hardening (2026-11-08, branch `vox-ipc-hardening`)
+
+A robustness pass on the port. Changes are in `CvConnectionService.cpp/.h`, plus `Lua/CvLuaGame.cpp` passing the
+Lua state to `UnregisterFunction`.
+
+- **Lifecycle.** All critical sections are created once in the constructor and deleted in the destructor (they
+  used to be created in `Setup` and deleted in `Shutdown`, so a UI add-in calling `Game.RegisterFunction` during a
+  save reload entered a deleted section and crashed the game). `Shutdown` now only clears data: registered and
+  external functions (`IsExternalRegistered` no longer stays true after a reload), pending calls (async callback
+  data is freed), paused players and queues, and it drops the private registry tables. It releases the game-core
+  lock while fencing out an in-flight drain, which avoids a deadlock with a UI drain. `Setup` undoes its
+  allocations if the thread can't start. Saving with no Lua state no longer crashes. `RegisterFunction`,
+  `UnregisterFunction` and `IsExternalRegistered` are safe at any time, including in games without `IPC_CHANNEL`.
+- **UI-thread pump.** If a UI add-in calls `Game.ProcessConnectionMessages` every frame (the Claude Bridge mod
+  does, on `Events.LocalMachineAppUpdate`), the UI thread is the only one that runs bridge Lua (`lua_execute`,
+  `lua_call`, async `CallExternal` callbacks) while it pumps. The game-core pump points (every game event,
+  `CvGame::update`) then skip, and a game-core sync `CallExternal` wait still receives its own reply. The DLL
+  can't take the engine's Lua lock, so Lua from the game-core thread could otherwise run at the same time as UI
+  Lua. Without a pump for 2 s it falls back to the old behaviour.
+- **Lua threads.** Each registered function gets its own Lua thread (`lua_newthread` from the registering context:
+  same globals, own stack), anchored in a registry table. `lua_call` and `!PostProcessGameEvent` run on it, and
+  async callbacks get a per-call thread. Calls no longer share the registering context's stack and never touch a
+  torn-down context's state pointer. Re-registering just overwrites; `UnregisterFunction` clears through the
+  caller's state.
+- **Pipe I/O.** The pipe thread alone owns and closes the handle (`Shutdown` used to close it too). No message is
+  dropped or split when the pipe is full (the write is retried from the same offset; a 0-byte non-blocking write no
+  longer spins). `ERROR_MORE_DATA` reads continue instead of dropping the connection. Every complete incoming
+  message is queued each iteration (the 100-message cap left messages stuck). No `FlushFileBuffers` (a stalled
+  client wedged the thread). The read buffer is on the heap. On connect the DLL announces every already-registered
+  Lua function (`lua_register`), so a bridge that connects late still learns them.
+- **Results and conversion.** `lua_response` is serialized before the Lua results are popped (ArduinoJson keeps
+  Lua string pointers, so popping first let Lua collect them). An overflowing response is reported as
+  `RESULT_TOO_LARGE` instead of a silently truncated success. No full Lua GC after every response (it stuttered).
+  Lua to JSON conversion has a depth cap of 32 and calls `lua_checkstack`, so deep or self-referencing tables no
+  longer overflow the stack, and it uses raw table access (no `__index` metamethods). External-call replies are
+  parsed into a buffer sized from the reply (they were limited to about 8 KB). `CallExternal` requests have 64 KB
+  of nodes (was 8 KB) and report `ARGS_TOO_LARGE` instead of sending truncated args. A sync-call reply that lands
+  right at the timeout no longer leaks. Call ids and event ids are thread-safe.
+- **Not changed:** the sync `Game.CallExternal` timeout is still 1 s, so long replies (an LLM, say) must use the
+  async callback form.
 
 ## Build
 
