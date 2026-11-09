@@ -1382,7 +1382,7 @@ int CvConnectionService::SendMessage(const DynamicJsonDocument& message, bool bD
 void CvConnectionService::ClearOutgoingQueue()
 {
 	EnterCriticalSection(&m_csOutgoing);
-	std::queue<std::string>().swap(m_outgoingQueue);
+	m_outgoingQueue = std::queue<std::string>(); // C++98: no queue::swap
 	m_uOutgoingBytes = 0;
 	m_lDroppedEvents = 0;
 	m_lDroppedEventsTotal = 0;
