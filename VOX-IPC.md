@@ -100,6 +100,31 @@ Lua state to `UnregisterFunction`.
 - **Not changed:** the sync `Game.CallExternal` timeout is still 1 s, so long replies (an LLM, say) must use the
   async callback form.
 
+## Reliability (2026-11-09, branch `vox-ipc-reliability`)
+
+Changes are in `CvConnectionService.cpp/.h`. Older bridges keep working: they ignore the new message types and
+never get the silence check.
+
+- **Bounded outgoing queue.** At 20,000 messages or 32 MB, new game events are dropped instead of queued (replies
+  and other messages always queue). A dropped event doesn't trigger the 20 ms throttle sleep. When the queue is
+  back under half, the client gets `{"type":"events_dropped","count":N}`. Before, a connected client that stopped
+  reading made the queue grow without limit and slowed every event by 20 ms.
+- **Stall watchdog.** A client that takes nothing from the pipe for 10 s while a message waits is disconnected (the
+  queue is cleared on the next connect), so a hung bridge can't slow the game for long.
+- **`hello` on connect**, before the `lua_register` announcements:
+  `{"type":"hello","protocol":1,"build":"<CURRENT_GAMECORE_VERSION>","pid":..,"turn":..,"ping_interval_ms":5000,
+  "silence_timeout_ms":30000,"stall_timeout_ms":10000,"max_queue":20000}`. `build` is the git describe string the
+  DLL was built from. A new connection never gets messages queued for an earlier one.
+- **Heartbeat.** Every 5 s the DLL sends `{"type":"ping","seq":n,"game_idle_ms":..,"ui_idle_ms":..,"queued":..,
+  "dropped_total":..}`. `game_idle_ms` / `ui_idle_ms` are the time since the game core (`CvGame::update`) / the UI
+  add-in last pumped (-1 = never): the pipe thread runs on its own, so pings keep coming while the game is frozen,
+  and these fields tell a hang from a slow turn. A client may answer `{"type":"pong","seq":n}` (it must start with
+  `{"type":"pong"`; pongs are handled on the pipe thread and never reach the game). Once a client has answered
+  one, it's disconnected after 30 s without sending anything.
+- **Log level.** Default INFO: DEBUG used to log every message in full (snapshots of 100 KB+, some on the game
+  thread). Set the environment variable `VOX_IPC_LOG_LEVEL=DEBUG` (or `WARNING`, `ERROR`) before starting the
+  game to change it.
+
 ## Build
 
 ```

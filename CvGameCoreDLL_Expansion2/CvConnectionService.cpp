@@ -22,6 +22,7 @@ left out). Licensed with the rest of this repository (GPL v3 + Community Patch E
 #include <climits>
 #include <algorithm>
 #include <psapi.h>
+#include "../commit_id.inc" // Vox IPC: CURRENT_GAMECORE_VERSION, sent in hello
 #pragma comment(lib, "psapi.lib")
 
 // Note: Buffer allocation moved to Setup() to avoid unnecessary memory usage when IPC is disabled
@@ -122,6 +123,11 @@ CvConnectionService::CvConnectionService()
 	, m_dwThreadId(0)
 	, m_bClientConnected(false)
 	, m_bShutdownRequested(false)
+	, m_uOutgoingBytes(0)
+	, m_lDroppedEvents(0)
+	, m_lDroppedEventsTotal(0)
+	, m_dwLastGameCoreTick(0)
+	, m_eMinLogLevel(LOG_INFO)
 	, m_uiNextCallId(1)
 	, m_iProcessingDepth(0)  // Vox Deorum: reentrancy guard for ProcessMessages
 	, m_bUiDrainPolicy(false)  // Vox Deorum: set by whichever drain is outermost
@@ -147,6 +153,16 @@ CvConnectionService::CvConnectionService()
 	InitializeCriticalSection(&m_csPendingCalls);
 	InitializeCriticalSection(&m_csPausedPlayers);
 	InitializeCriticalSection(&m_csEventSequence);
+
+	// Vox IPC: DEBUG logs every message in full (large snapshots, on the game thread), so the
+	// default is INFO. VOX_IPC_LOG_LEVEL=DEBUG brings it back.
+	const char* szLevel = getenv("VOX_IPC_LOG_LEVEL");
+	if (szLevel)
+	{
+		if (_stricmp(szLevel, "DEBUG") == 0) m_eMinLogLevel = LOG_DEBUG;
+		else if (_stricmp(szLevel, "WARNING") == 0) m_eMinLogLevel = LOG_WARNING;
+		else if (_stricmp(szLevel, "ERROR") == 0) m_eMinLogLevel = LOG_ERROR;
+	}
 }
 
 // Destructor
@@ -441,12 +457,7 @@ void CvConnectionService::Shutdown()
 		m_incomingQueue.pop();
 	}
 	LeaveCriticalSection(&m_csIncoming);
-	EnterCriticalSection(&m_csOutgoing);
-	while (!m_outgoingQueue.empty())
-	{
-		m_outgoingQueue.pop();
-	}
-	LeaveCriticalSection(&m_csOutgoing);
+	ClearOutgoingQueue();
 
 	m_bInitialized = false;
 	m_bClientConnected = false;
@@ -459,6 +470,10 @@ void CvConnectionService::Log(LogLevel level, const char* message)
 	// Vox Deorum: Guard against NULL messages to prevent downstream pLog->Msg(NULL)
 	// which scans memory for a terminator and can walk past the end of mapped pages.
 	if (message == NULL)
+	{
+		return;
+	}
+	if (level < m_eMinLogLevel)
 	{
 		return;
 	}
@@ -538,6 +553,11 @@ void CvConnectionService::Log(LogLevel level, const char* message)
 }
 
 // Vox Deorum: Separate function to handle SEH without C2712 error
+bool CvConnectionService::IsLogging(LogLevel level) const
+{
+	return level >= m_eMinLogLevel && GC.getLogging();
+}
+
 void CvConnectionService::SafeLogMessage(FILogFile* pLog, const char* message)
 {
 	// Vox Deorum: Guard before entering the __try. pLog->Msg(NULL) will scan past the
@@ -767,7 +787,18 @@ void CvConnectionService::HandleClientConnection(HANDLE hPipe)
 	size_t pendingOffset = 0;
 	bool bHasPending = false;
 
+	// Vox IPC (reliability): nothing from an earlier connection reaches this client; hello
+	// comes first, then the registered functions.
+	ClearOutgoingQueue();
+	QueueHello();
 	AnnounceRegisteredFunctions();
+
+	// Vox IPC (reliability): watchdog and heartbeat state
+	DWORD dwLastWriteProgress = GetTickCount(); // last write, or last moment with nothing to send
+	DWORD dwLastReceived = GetTickCount();
+	DWORD dwLastPing = GetTickCount();
+	unsigned int uiPingSeq = 0;
+	bool bClientAnswersPings = false;
 
 	while (m_bClientConnected && !m_bShutdownRequested)
 	{
@@ -782,6 +813,7 @@ void CvConnectionService::HandleClientConnection(HANDLE hPipe)
 			{
 				if (!DequeueOutgoingMessage(pendingMessage))
 				{
+					dwLastWriteProgress = GetTickCount(); // Vox IPC: nothing waiting, so no stall
 					break; // No more messages to send
 				}
 				// Add delimiter to the message
@@ -827,12 +859,16 @@ void CvConnectionService::HandleClientConnection(HANDLE hPipe)
 				pendingOffset += bytesWritten;
 				bytesWrittenThisIteration += bytesWritten;
 				bDidWork = true;
+				dwLastWriteProgress = GetTickCount();
 
 				if (pendingOffset >= pendingMessage.length())
 				{
-					std::stringstream ss;
-					ss << "HandleClientConnection - Sent outgoing message: " << pendingMessage;
-					Log(LOG_DEBUG, ss.str().c_str());
+					if (IsLogging(LOG_DEBUG))
+					{
+						std::stringstream ss;
+						ss << "HandleClientConnection - Sent outgoing message: " << pendingMessage;
+						Log(LOG_DEBUG, ss.str().c_str());
+					}
 					pendingMessage.clear();
 					pendingOffset = 0;
 					bHasPending = false;
@@ -894,6 +930,7 @@ void CvConnectionService::HandleClientConnection(HANDLE hPipe)
 				messageBuffer.append(&readBuffer[0], bytesRead);
 				bytesReadThisIteration += bytesRead;
 				bDidWork = true;
+				dwLastReceived = GetTickCount();
 			}
 		}
 
@@ -903,7 +940,18 @@ void CvConnectionService::HandleClientConnection(HANDLE hPipe)
 		while (pos != std::string::npos)
 		{
 			// Only queue non-empty messages
-			if (pos > start)
+			// Vox IPC (reliability): a pong only proves the client is alive; it never reaches
+			// the game. The client must send it with "type" first: {"type":"pong",...}
+			static const char szPong[] = "{\"type\":\"pong\"";
+			if (pos > start && pos - start < 256 && messageBuffer.compare(start, sizeof(szPong) - 1, szPong) == 0)
+			{
+				if (!bClientAnswersPings)
+				{
+					bClientAnswersPings = true;
+					Log(LOG_INFO, "HandleClientConnection - Client answers pings; silence check on");
+				}
+			}
+			else if (pos > start)
 			{
 				std::string singleMessage = messageBuffer.substr(start, pos - start);
 
@@ -913,9 +961,12 @@ void CvConnectionService::HandleClientConnection(HANDLE hPipe)
 				LeaveCriticalSection(&m_csIncoming);
 
 				// Log the queuing action
-				std::stringstream ss;
-				ss << "HandleClientConnection - Queued message: " << singleMessage;
-				Log(LOG_DEBUG, ss.str().c_str());
+				if (IsLogging(LOG_DEBUG))
+				{
+					std::stringstream ss;
+					ss << "HandleClientConnection - Queued message: " << singleMessage;
+					Log(LOG_DEBUG, ss.str().c_str());
+				}
 			}
 			start = pos + delimiter.length();
 			pos = messageBuffer.find(delimiter, start);
@@ -938,6 +989,31 @@ void CvConnectionService::HandleClientConnection(HANDLE hPipe)
 			messageBuffer.clear();
 			messageBuffer.reserve(262144); // Re-reserve standard capacity
 			scanFrom = 0;
+		}
+
+		// Vox IPC (reliability): report dropped events, watchdogs, heartbeat
+		QueueDroppedNotice();
+		DWORD dwNow = GetTickCount();
+		if (bHasPending && dwNow - dwLastWriteProgress > CLIENT_STALL_TIMEOUT_MS)
+		{
+			std::stringstream ss;
+			ss << "HandleClientConnection - Client took nothing from the pipe for "
+			   << (dwNow - dwLastWriteProgress) << " ms with messages waiting; disconnecting";
+			Log(LOG_WARNING, ss.str().c_str());
+			break;
+		}
+		if (bClientAnswersPings && dwNow - dwLastReceived > CLIENT_SILENCE_TIMEOUT_MS)
+		{
+			std::stringstream ss;
+			ss << "HandleClientConnection - No data from the client for " << (dwNow - dwLastReceived)
+			   << " ms (it answered pings before); disconnecting";
+			Log(LOG_WARNING, ss.str().c_str());
+			break;
+		}
+		if (dwNow - dwLastPing >= PING_INTERVAL_MS)
+		{
+			QueuePing(++uiPingSeq);
+			dwLastPing = dwNow;
 		}
 
 		// Small delay to avoid busy waiting when idle (nothing read or written)
@@ -967,14 +1043,25 @@ void CvConnectionService::HandleClientConnection(HANDLE hPipe)
 
 // Queue an outgoing message to send to the Bridge Service (called from game thread)
 // Returns the length of the outgoing queue after adding the message
-int CvConnectionService::QueueOutgoingMessage(const std::string& messageJson)
+int CvConnectionService::QueueOutgoingMessage(const std::string& messageJson, bool bDroppable)
 {
 	// Lock the outgoing queue critical section
 	EnterCriticalSection(&m_csOutgoing);
-	
+
+	// Vox IPC (reliability): a full queue drops game events instead of growing without limit
+	// (a connected client that stopped reading used to slow every event by 20 ms forever)
+	if (bDroppable && (m_outgoingQueue.size() >= MAX_OUTGOING_MESSAGES || m_uOutgoingBytes >= MAX_OUTGOING_BYTES))
+	{
+		m_lDroppedEvents++;
+		m_lDroppedEventsTotal++;
+		LeaveCriticalSection(&m_csOutgoing);
+		return -1;
+	}
+
 	// Add the message to the queue
 	m_outgoingQueue.push(messageJson);
-	
+	m_uOutgoingBytes += messageJson.size();
+
 	// Get the queue size
 	int queueSize = static_cast<int>(m_outgoingQueue.size());
 	
@@ -998,6 +1085,7 @@ bool CvConnectionService::DequeueOutgoingMessage(std::string& messageJson)
 		// Get the message from the front of the queue
 		messageJson = m_outgoingQueue.front();
 		m_outgoingQueue.pop();
+		m_uOutgoingBytes -= std::min(m_uOutgoingBytes, messageJson.size());
 		hasMessage = true;
 	}
 	
@@ -1010,6 +1098,7 @@ bool CvConnectionService::DequeueOutgoingMessage(std::string& messageJson)
 // Process queued messages from the main game thread
 void CvConnectionService::ProcessMessages()
 {
+	m_dwLastGameCoreTick = GetTickCount(); // Vox IPC: reported by ping (game_idle_ms)
 	DrainIncomingMessages(DRAIN_GAME_CORE);
 }
 
@@ -1273,7 +1362,7 @@ void CvConnectionService::DrainIncomingMessages(DrainCaller eCaller)
 
 // Send a message to the Bridge Service (called from game code)
 // Returns the length of the outgoing queue after adding the message
-int CvConnectionService::SendMessage(const DynamicJsonDocument& message)
+int CvConnectionService::SendMessage(const DynamicJsonDocument& message, bool bDroppable)
 {
 	if (!m_bInitialized)
 	{
@@ -1286,7 +1375,90 @@ int CvConnectionService::SendMessage(const DynamicJsonDocument& message)
 	serializeJson(message, messageStr);
 	
 	// Queue the wrapped message and return the queue size
-	return QueueOutgoingMessage(messageStr);
+	return QueueOutgoingMessage(messageStr, bDroppable);
+}
+
+// Vox IPC (reliability): empty the outgoing queue (new connection or shutdown)
+void CvConnectionService::ClearOutgoingQueue()
+{
+	EnterCriticalSection(&m_csOutgoing);
+	std::queue<std::string>().swap(m_outgoingQueue);
+	m_uOutgoingBytes = 0;
+	m_lDroppedEvents = 0;
+	m_lDroppedEventsTotal = 0;
+	LeaveCriticalSection(&m_csOutgoing);
+}
+
+// Vox IPC (reliability): first message on every connection, so the client can check what it
+// talks to. Pipe thread; queues directly (SendMessage checks m_bInitialized).
+void CvConnectionService::QueueHello()
+{
+	DynamicJsonDocument doc(1024);
+	doc["type"] = "hello";
+	doc["protocol"] = (int)IPC_PROTOCOL_VERSION;
+	doc["build"] = CURRENT_GAMECORE_VERSION;
+	doc["pid"] = (unsigned long)GetCurrentProcessId();
+	doc["turn"] = m_uiCurrentTurn; // cached; GC.getGame() isn't safe off the main thread
+	doc["ping_interval_ms"] = (unsigned long)PING_INTERVAL_MS;
+	doc["silence_timeout_ms"] = (unsigned long)CLIENT_SILENCE_TIMEOUT_MS;
+	doc["stall_timeout_ms"] = (unsigned long)CLIENT_STALL_TIMEOUT_MS;
+	doc["max_queue"] = (unsigned long)MAX_OUTGOING_MESSAGES;
+	std::string messageStr;
+	serializeJson(doc, messageStr);
+	QueueOutgoingMessage(messageStr);
+}
+
+// Vox IPC (reliability): heartbeat from the pipe thread. game_idle_ms / ui_idle_ms say how
+// long since the game core / UI add-in last pumped (-1 = never), so a client can tell a
+// frozen game (pipe alive, game idle) from a slow turn.
+void CvConnectionService::QueuePing(unsigned int uiSeq)
+{
+	DWORD dwNow = GetTickCount();
+	DWORD dwGame = m_dwLastGameCoreTick;
+	DWORD dwUi = m_dwLastUiPumpTick;
+	EnterCriticalSection(&m_csOutgoing);
+	unsigned long ulQueued = (unsigned long)m_outgoingQueue.size();
+	long lDropped = m_lDroppedEventsTotal;
+	LeaveCriticalSection(&m_csOutgoing);
+
+	DynamicJsonDocument doc(512);
+	doc["type"] = "ping";
+	doc["seq"] = uiSeq;
+	doc["game_idle_ms"] = dwGame ? (long)(dwNow - dwGame) : -1L;
+	doc["ui_idle_ms"] = dwUi ? (long)(dwNow - dwUi) : -1L;
+	doc["queued"] = ulQueued;
+	doc["dropped_total"] = lDropped;
+	std::string messageStr;
+	serializeJson(doc, messageStr);
+	QueueOutgoingMessage(messageStr);
+}
+
+// Vox IPC (reliability): once the queue has room again, say how many events were dropped
+void CvConnectionService::QueueDroppedNotice()
+{
+	EnterCriticalSection(&m_csOutgoing);
+	long lDropped = 0;
+	if (m_lDroppedEvents > 0 && m_outgoingQueue.size() < MAX_OUTGOING_MESSAGES / 2 && m_uOutgoingBytes < MAX_OUTGOING_BYTES / 2)
+	{
+		lDropped = m_lDroppedEvents;
+		m_lDroppedEvents = 0;
+	}
+	LeaveCriticalSection(&m_csOutgoing);
+	if (lDropped == 0)
+	{
+		return;
+	}
+
+	std::stringstream ss;
+	ss << "HandleClientConnection - Dropped " << lDropped << " game events while the queue was full";
+	Log(LOG_WARNING, ss.str().c_str());
+
+	DynamicJsonDocument doc(256);
+	doc["type"] = "events_dropped";
+	doc["count"] = lDropped;
+	std::string messageStr;
+	serializeJson(doc, messageStr);
+	QueueOutgoingMessage(messageStr);
 }
 
 // Route incoming message to appropriate handler based on type
@@ -2709,12 +2881,16 @@ void CvConnectionService::ForwardGameEvent(const char* eventName, ICvEngineScrip
 		else if (hasSchema)
 		{
 
-			std::stringstream ss;
-			ss << "ForwardGameEvent - Forwarding event '" << eventName << "' with arguments " << argCount;
-			Log(LOG_DEBUG, ss.str().c_str());
+			if (IsLogging(LOG_DEBUG))
+			{
+				std::stringstream ss;
+				ss << "ForwardGameEvent - Forwarding event '" << eventName << "' with arguments " << argCount;
+				Log(LOG_DEBUG, ss.str().c_str());
+			}
 
 			// Send the message asynchronously via the queue
-			if (SendMessage(message) >= 5) {
+			// Vox IPC (reliability): droppable; a dropped event (-1) doesn't throttle
+			if (SendMessage(message, true) >= 5) {
 				// Vox Deorum: Release game core lock during throttle sleep to avoid
 				// blocking the UI thread for 20ms (which increases lock contention)
 				bool bHadLock = gDLL->HasGameCoreLock();

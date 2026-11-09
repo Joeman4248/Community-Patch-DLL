@@ -46,6 +46,8 @@ public:
 
 	// Log a message to the connection log file
 	void Log(LogLevel level, const char* message);
+	// Vox IPC: whether Log would write this level (check before building costly messages)
+	bool IsLogging(LogLevel level) const;
 
 	// Process queued messages from the main game thread
 	void ProcessMessages();
@@ -61,8 +63,9 @@ public:
 	void ProcessMessagesFromUI();
 	
 	// Send a message to the Bridge Service (called from game code)
-	// Returns the length of the outgoing queue after adding the message
-	int SendMessage(const DynamicJsonDocument& message);
+	// Returns the length of the outgoing queue after adding the message.
+	// Vox IPC: bDroppable marks a game event, dropped (returns -1) while the queue is full.
+	int SendMessage(const DynamicJsonDocument& message, bool bDroppable = false);
 
 	// Register a Lua function for external calling
 	void RegisterLuaFunction(const char* name, lua_State* L, int stackIndex);
@@ -148,10 +151,16 @@ private:
 	// Handle a single client connection
 	void HandleClientConnection(HANDLE hPipe);
 	void AnnounceRegisteredFunctions(); // Vox IPC: queue lua_register for each known function on connect
+	// Vox IPC (reliability): pipe-thread helpers, see VOX-IPC.md "Reliability"
+	void ClearOutgoingQueue();
+	void QueueHello();
+	void QueuePing(unsigned int uiSeq);
+	void QueueDroppedNotice();
 
 	// Queue management methods
-	// Returns the length of the outgoing queue after adding the message
-	int QueueOutgoingMessage(const std::string& messageJson);
+	// Returns the length of the outgoing queue after adding the message, or -1 when a
+	// droppable message was dropped because the queue is full (Vox IPC)
+	int QueueOutgoingMessage(const std::string& messageJson, bool bDroppable = false);
 	bool DequeueOutgoingMessage(std::string& messageJson);
 	
 	// Message routing and handling. Returns false when bUiPolicy declined the message
@@ -257,6 +266,24 @@ private:
 	DWORD m_dwThreadId;
 	volatile bool m_bClientConnected;
 	volatile bool m_bShutdownRequested;
+
+	// Vox IPC (reliability): outgoing queue limits, stall watchdog and heartbeat.
+	// Over either queue limit, new game events are dropped and counted (one events_dropped
+	// notice follows once the queue is half empty); replies and other messages always queue.
+	static const size_t MAX_OUTGOING_MESSAGES = 20000;
+	static const size_t MAX_OUTGOING_BYTES = 33554432; // 32 MB
+	// A client that takes nothing from the pipe for this long while a message waits is dropped
+	static const DWORD CLIENT_STALL_TIMEOUT_MS = 10000;
+	// The pipe thread sends a ping this often. A client that has answered one with a pong is
+	// dropped after this long without sending anything (older clients never answer: no check).
+	static const DWORD PING_INTERVAL_MS = 5000;
+	static const DWORD CLIENT_SILENCE_TIMEOUT_MS = 30000;
+	static const int IPC_PROTOCOL_VERSION = 1;
+	size_t m_uOutgoingBytes;            // bytes in m_outgoingQueue (under m_csOutgoing)
+	LONG m_lDroppedEvents;              // dropped since the last events_dropped notice (under m_csOutgoing)
+	LONG m_lDroppedEventsTotal;         // dropped this connection (under m_csOutgoing)
+	volatile DWORD m_dwLastGameCoreTick; // last ProcessMessages (CvGame::update), reported by ping
+	LogLevel m_eMinLogLevel;            // lower levels aren't logged; env VOX_IPC_LOG_LEVEL=DEBUG|INFO|WARNING|ERROR
 
 	// Vox Deorum: List of paused players
 	std::set<int> m_pausedPlayers;
