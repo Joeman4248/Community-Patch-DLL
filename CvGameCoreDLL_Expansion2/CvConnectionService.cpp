@@ -2211,9 +2211,15 @@ void CvConnectionService::ConvertLuaToJsonValue(lua_State* L, int index, JsonVar
 						// Convert number to string without modifying the stack
 						double numKey = lua_tonumber(L, keyIndex);
 						std::stringstream ss;
-						if (numKey == floor(numKey))
+						// Vox IPC: only cast whole numbers that fit an int (a bigger or infinite key made
+						// every such key "-2147483648"); others print like Lua's tostring (%.14g)
+						if (numKey == floor(numKey) && numKey >= INT_MIN && numKey <= INT_MAX)
 						{
 							ss << static_cast<int>(numKey);
+						}
+						else if (numKey == floor(numKey))
+						{
+							ss << std::setprecision(14) << numKey;
 						}
 						else
 						{
