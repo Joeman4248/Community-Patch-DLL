@@ -4302,10 +4302,16 @@ class TextFormatter {
     if (specialChar) {
       writeRaw('\\');
       writeRaw(specialChar);
-    } else if (c) {
+    } else if (static_cast<unsigned char>(c) >= 0x20) {
       writeRaw(c);
     } else {
-      writeRaw("\\u0000");
+      // Vox IPC: JSON needs every control character escaped, not only NUL
+      // (strict parsers such as Node's JSON.parse reject them raw)
+      static const char hex[] = "0123456789abcdef";
+      char esc[7] = {'\\', 'u', '0', '0', 0, 0, 0};
+      esc[4] = hex[(static_cast<unsigned char>(c) >> 4) & 0xf];
+      esc[5] = hex[static_cast<unsigned char>(c) & 0xf];
+      writeRaw(esc);
     }
   }
   template <typename T>

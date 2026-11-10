@@ -20,6 +20,8 @@ left out). Licensed with the rest of this repository (GPL v3 + Community Patch E
 #include <iomanip>
 #include <cmath>
 #include <climits>
+#include <cfloat> // Vox IPC: DBL_MAX
+#include <cstdlib> // Vox IPC: strtod
 #include <algorithm>
 #include <psapi.h>
 #include "../commit_id.inc" // Vox IPC: CURRENT_GAMECORE_VERSION, sent in hello
@@ -1985,8 +1987,35 @@ void CvConnectionService::ConvertLuaToJsonValue(lua_State* L, int index, JsonVar
 					parent.set(intNum);
 				}
 			}
+			else if (num == num && num <= DBL_MAX && num >= -DBL_MAX)
+			{
+				// Vox IPC: ArduinoJson writes doubles with only 9 significant digits
+				// (123456789012 -> 1.23456789e11), so write the shortest of %.15g / %.17g
+				// that reads back exactly, as raw JSON copied into the document.
+				std::ostringstream ss;
+				ss << std::setprecision(15) << num;
+				if (strtod(ss.str().c_str(), NULL) != num)
+				{
+					ss.str("");
+					ss << std::setprecision(17) << num;
+				}
+				std::string text = ss.str();
+				if (key && parent.is<JsonObject>())
+				{
+					parent[key] = serialized(text);
+				}
+				else if (parent.is<JsonArray>())
+				{
+					parent.add(serialized(text));
+				}
+				else
+				{
+					parent.set(serialized(text));
+				}
+			}
 			else
 			{
+				// NaN / infinity: ArduinoJson writes null (JSON has no such numbers)
 				if (key && parent.is<JsonObject>())
 				{
 					parent[key] = num;
@@ -2212,18 +2241,20 @@ void CvConnectionService::ConvertLuaToJsonValue(lua_State* L, int index, JsonVar
 						double numKey = lua_tonumber(L, keyIndex);
 						std::stringstream ss;
 						// Vox IPC: only cast whole numbers that fit an int (a bigger or infinite key made
-						// every such key "-2147483648"); others print like Lua's tostring (%.14g)
+						// every such key "-2147483648"); others get the shortest of %.15g / %.17g that
+						// reads back exactly (the default 6 digits merged keys like 0.1234567 and 0.1234568)
 						if (numKey == floor(numKey) && numKey >= INT_MIN && numKey <= INT_MAX)
 						{
 							ss << static_cast<int>(numKey);
 						}
-						else if (numKey == floor(numKey))
-						{
-							ss << std::setprecision(14) << numKey;
-						}
 						else
 						{
-							ss << numKey;
+							ss << std::setprecision(15) << numKey;
+							if (strtod(ss.str().c_str(), NULL) != numKey && numKey == numKey)
+							{
+								ss.str("");
+								ss << std::setprecision(17) << numKey;
+							}
 						}
 						keyStorage = ss.str();
 						key = keyStorage.c_str();

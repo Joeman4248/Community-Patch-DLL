@@ -121,6 +121,11 @@ never get the silence check.
   and these fields tell a hang from a slow turn. A client may answer `{"type":"pong","seq":n}` (it must start with
   `{"type":"pong"`; pongs are handled on the pipe thread and never reach the game). Once a client has answered
   one, it's disconnected after 30 s without sending anything.
+- **JSON output.** Control characters in strings are escaped as `\u00XX` (they went out raw, which strict parsers
+  such as Node's reject; patched in `ThirdPartyLibs/ArduinoJson.hpp`). Lua numbers outside the int range are written
+  with full precision (ArduinoJson kept 9 digits: `123456789012` became `1.23456789e11`), and so are number keys
+  (keys beyond the int range all became `"-2147483648"`; fractional keys had 6 digits). Tested by
+  `tests/vox-ipc/run.sh` (Linux, real Lua 5.1, ASan/UBSan; its README lists what's still known to differ).
 - **Log level.** Default INFO: DEBUG used to log every message in full (snapshots of 100 KB+, some on the game
   thread). Set the environment variable `VOX_IPC_LOG_LEVEL=DEBUG` (or `WARNING`, `ERROR`) before starting the
   game to change it.

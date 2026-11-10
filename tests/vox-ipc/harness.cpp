@@ -7,6 +7,7 @@
 #include <iomanip>
 #include <cmath>
 #include <climits>
+#include <cfloat>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
