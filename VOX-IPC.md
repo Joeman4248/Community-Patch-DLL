@@ -130,6 +130,12 @@ never get the silence check.
   thread). Set the environment variable `VOX_IPC_LOG_LEVEL=DEBUG` (or `WARNING`, `ERROR`) before starting the
   game to change it.
 
+## House rule: automated workers and routes (2026-11-11, branch `human-worker-routes`)
+
+Not part of the IPC port; a gameplay change. In `CvBuilderTaskingAI::AddRouteDirective`, a human player's
+automated workers never build railroads and never replace a route with a lesser one (railroad → road).
+AI players are unchanged. Workers still repair pillaged railroads (`AddRepairRouteDirective`).
+
 ## Build
 
 ```
