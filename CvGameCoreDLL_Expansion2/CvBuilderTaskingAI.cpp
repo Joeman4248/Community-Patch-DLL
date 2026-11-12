@@ -2786,6 +2786,16 @@ void CvBuilderTaskingAI::AddRouteDirective(vector<OptionWithScore<BuilderDirecti
 		(m_pPlayer->isMinorCiv() || GET_TEAM(eMyTeam).IsVassal(GET_PLAYER(pPlot->GetPlayerThatBuiltRoute()).getTeam()) || eMyTeam != GET_PLAYER(pPlot->GetPlayerResponsibleForRoute()).getTeam()))
 		return;
 
+	// House rule: a human's automated workers never build railroads and never downgrade a route
+	// (e.g. railroad -> road). Repairing a pillaged railroad still goes through AddRepairRouteDirective.
+	if (m_pPlayer->isHuman(ISHUMAN_AI_UNITS))
+	{
+		if (eRoute == ROUTE_RAILROAD)
+			return;
+		if (pPlot->getRouteType() > eRoute && !pPlot->IsRoutePillaged())
+			return;
+	}
+
 	BuildTypes eRouteBuild = GetBuildRoute(eRoute);
 
 	// can we even build the desired route
